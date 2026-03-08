@@ -1,0 +1,15 @@
+universe = vanilla
+executable = /storage/gpfs_data/juno/junofs/users/gferrante/TAO/data_analysis/energy_spectrum/launch_plot_energy_resolution.sh
+
+log = /storage/gpfs_data/juno/junofs/users/gferrante/TAO/data_analysis/energy_spectrum/out-err/launch_plot_energy_resolution.log
+output = /storage/gpfs_data/juno/junofs/users/gferrante/TAO/data_analysis/energy_spectrum/out-err/launch_plot_energy_resolution.out
+error = /storage/gpfs_data/juno/junofs/users/gferrante/TAO/data_analysis/energy_spectrum/out-err/launch_plot_energy_resolution.err
+
+# Runtime: 1 hour should be enough for plotting
++MaxRuntime = 3600
+
+ShouldTransferFiles = YES
+WhenToTransferOutput = ON_EXIT
++SingularityImage = false
+
+queue 1
