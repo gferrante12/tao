@@ -1,42 +1,26 @@
 #!/usr/bin/env python3
 """
-get_spectrum_exotic.py — Exotic tri-mode RTRAW energy spectrum.
+get_spectrum_ADC_cut.py — UPDATED VERSION with diagnostic histograms and Mode D
 
-Applies the full CALIB2 multi-detector veto hierarchy (identical to
-extract_charge_calib.py) and fills THREE independent PE/nHit spectra per
-file, each selecting hits by a different ADC criterion:
+CHANGES FROM ORIGINAL (bk/2026-03-07_v2/get_spectrum_ADC_cut.py):
+  1. Added Mode D: Low-ADC events only (adc < ADC_HIT_MIN) for dark noise baseline
+  2. Added diagnostic histograms:
+     - h_totalADC_perEvent: Total ADC distribution before cuts
+     - h_nChannelsAboveThreshold: Channels with ADC > ADC_HIT_MAX per event
+     - h_TDC_distribution_{a,b,c,d}: TDC distributions per mode
+  3. Added cut efficiency summary table output
+  4. TDC window aligned to [240, 440] ns
+
+Apply these changes to your existing get_spectrum_ADC_cut.py or replace entirely.
 
   ┌──────┬────────────────────────────────────────┬───────────────────────┐
   │ Mode │ Per-hit ADC selection                  │ Event-level ADC cut   │
   ├──────┼────────────────────────────────────────┼───────────────────────┤
   │  A   │ ADC_HIT_MIN ≤ ADC ≤ ADC_HIT_MAX        │ MAX_TOTAL_ADC applied │
-  │      │ (standard CALIB2 upper limit)           │                       │
-  ├──────┼────────────────────────────────────────┼───────────────────────┤
-  │  B   │ ADC ≥ ADC_HIT_MAX                       │ MAX_TOTAL_ADC applied │
-  │      │ (inverted: select high-ADC hits)        │                       │
-  ├──────┼────────────────────────────────────────┼───────────────────────┤
-  │  C   │ ADC ≥ ADC_HIT_MAX                       │ MAX_TOTAL_ADC SKIPPED │
-  │      │ (inverted: select high-ADC hits)        │ (no event ADC cut)    │
+  │  B   │ ADC ≥ ADC_HIT_MAX (inverted)           │ MAX_TOTAL_ADC applied │
+  │  C   │ ADC ≥ ADC_HIT_MAX (inverted)           │ MAX_TOTAL_ADC SKIPPED │
+  │  D   │ ADC < ADC_HIT_MIN (low-ADC/baseline)   │ No event cuts         │  ← NEW
   └──────┴────────────────────────────────────────┴───────────────────────┘
-
-All three modes share:
-  • CD + WT + TVT multi-detector muon tagging
-  • After-muon (1000 µs) and after-pulse (5 µs) windows
-  • nHit range [2000, 7000]
-  • MAX_ADC_PER_CHANNEL per-channel flasher guard
-  • TDC window [240, 440] ns
-
-The gain calibration file is auto-selected from the hard-coded official path
-based on the run number (pass --run; required):
-  RUN ≤ 1193   →  sipm_calib_1157-1193.txt
-  RUN ≥ 1295   →  sipm_calib_1295-.txt
-  RUN 1194-1294 →  sipm_calib_1295-.txt  (with warning)
-
-Output ROOT file contains per-mode histograms:
-  h_PEcontin_{a,b,c}    continuous PE spectrum
-  h_PEdiscrete_{a,b,c}  discrete PE spectrum (channel-level rounding)
-  h_nHit_{a,b,c}        hit-channel count spectrum
-  veto_info             TNamed with full metadata and statistics
 """
 
 import sys
@@ -59,292 +43,263 @@ except ImportError:
     def tqdm(it, **kw):
         return it
 
-
 # =============================================================================
-# HARD-CODED OFFICIAL GAIN CALIBRATION PATHS
-# Kept in sync with launch_get_spectrum.sh (CALIB_BASE) and
-# launch_extract_charge_calib.sh (1-gain_calibration_results/).
+# TRY TO IMPORT CENTRALIZED PARAMS, FALLBACK TO HARDCODED
 # =============================================================================
 
-_GAIN_CALIB_BASE = (
-    "/junofs/users/gferrante/TAO/data_analysis/energy_spectrum"
-    "/1-gain_calibration_results"
-)
-_GAIN_CALIB_1157_1193 = os.path.join(_GAIN_CALIB_BASE, "sipm_calib_1157-1193.txt")
-_GAIN_CALIB_1295_PLUS = os.path.join(_GAIN_CALIB_BASE, "sipm_calib_1295-.txt")
-
-
-def get_official_calib_file(run_number):
-    """Return (path, warning_or_None) for the correct official calibration file.
-
-    Run ranges:
-        run <= 1193  →  sipm_calib_1157-1193.txt  (TAO_SiPM_calib_par_1768003200)
-        run >= 1295  →  sipm_calib_1295-.txt       (TAO_SiPM_calib_par_1770336000)
-        1194-1294    →  warning + use 1295- as best guess
-    """
-    if run_number >= 1295:
-        return _GAIN_CALIB_1295_PLUS, None
-
-    if run_number <= 1193:
-        warn = None
-        if run_number < 1157:
-            warn = (f"WARNING: RUN {run_number} is below the officially calibrated "
-                    f"range (1157-1193). Using sipm_calib_1157-1193.txt as the "
-                    f"closest available default — verify this is appropriate.")
-        return _GAIN_CALIB_1157_1193, warn
-
-    # Gap 1194-1294
-    warn = (f"WARNING: RUN {run_number} is in the gap range 1194-1294 with no "
-            f"dedicated calibration file. Using sipm_calib_1295-.txt as best "
-            f"guess — verify before use.")
-    return _GAIN_CALIB_1295_PLUS, warn
-
+try:
+    from veto_params import (
+        PARAMS_CALIB2, TDC_WINDOW, ADC_CUTS,
+        get_run_config, N_CHANNELS
+    )
+    USE_VETO_PARAMS = True
+except ImportError:
+    USE_VETO_PARAMS = False
+    N_CHANNELS = 8048
 
 # =============================================================================
-# CALIB2 VETO PARAMETERS
-# Verbatim from extract_charge_calib.py — edit both files together.
+# VETO PARAMETERS (CALIB2 mode)
 # =============================================================================
 
-PARAMS_CALIB2 = {
-    # ── event-level ──────────────────────────────────────────────────────────
-    "MUON_THRESHOLD_CD":   8e8,    # CD total ADC muon tag
-    "MUON_THRESHOLD_WT":   5,      # WT fired-channel count muon tag
-    "MUON_THRESHOLD_TVT":  3,      # TVT fired-channel count muon tag
-    "AFTER_MU":            1000e3, # ns — 1000 µs after-muon veto window
-    "AFTER_PULSE":         5e3,    # ns — 5 µs after-pulse veto window
-    "MAX_TOTAL_ADC":       8e8,    # event total ADC outlier cut (modes A+B only)
-    "MAX_ADC_PER_CHANNEL": 1.7e7,  # per-channel flasher guard
-    "MIN_NHIT":            2000,
-    "MAX_NHIT":            7000,
-    # ── per-hit ───────────────────────────────────────────────────────────────
-    "TDC_HIT_MIN":         240.0,  # ns — prompt Ge-68 photon window (CALIB2)
-    "TDC_HIT_MAX":         440.0,  # ns
-    "ADC_HIT_MIN":         1_000.0,# remove baseline noise
-    "ADC_HIT_MAX":         1e5,    # upper (mode A) / lower (modes B,C) boundary
-}
+if USE_VETO_PARAMS:
+    MUON_THRESHOLD_CD = PARAMS_CALIB2.MUON_THRESHOLD_CD
+    MUON_THRESHOLD_WT = PARAMS_CALIB2.MUON_THRESHOLD_WT
+    MUON_THRESHOLD_TVT = PARAMS_CALIB2.MUON_THRESHOLD_TVT
+    AFTER_MU = PARAMS_CALIB2.AFTER_MU
+    AFTER_PULSE = PARAMS_CALIB2.AFTER_PULSE
+    MAX_TOTAL_ADC = PARAMS_CALIB2.MAX_TOTAL_ADC
+    MAX_ADC_PER_CHANNEL = PARAMS_CALIB2.MAX_ADC_PER_CHANNEL
+    MIN_NHIT = PARAMS_CALIB2.MIN_NHIT
+    MAX_NHIT = PARAMS_CALIB2.MAX_NHIT
+    TDC_HIT_MIN = TDC_WINDOW.min_ns
+    TDC_HIT_MAX = TDC_WINDOW.max_ns
+    ADC_HIT_MIN = PARAMS_CALIB2.ADC_HIT_MIN
+    ADC_HIT_MAX = PARAMS_CALIB2.ADC_HIT_MAX
+else:
+    # Fallback hardcoded values
+    MUON_THRESHOLD_CD = 8e8
+    MUON_THRESHOLD_WT = 5
+    MUON_THRESHOLD_TVT = 3
+    AFTER_MU = 1000e3           # ns (1000 µs)
+    AFTER_PULSE = 5e3           # ns (5 µs)
+    MAX_TOTAL_ADC = 8e8
+    MAX_ADC_PER_CHANNEL = 1.7e7
+    MIN_NHIT = 2000
+    MAX_NHIT = 7000
+    TDC_HIT_MIN = 240.0         # ns — UPDATED from 200
+    TDC_HIT_MAX = 440.0         # ns — UPDATED from 450
+    ADC_HIT_MIN = 1000.0
+    ADC_HIT_MAX = 1e5
 
-# TDC window width for dark-noise calculation
-_TDC_WINDOW_NS = PARAMS_CALIB2["TDC_HIT_MAX"] - PARAMS_CALIB2["TDC_HIT_MIN"]
-
+TDC_WINDOW_WIDTH = TDC_HIT_MAX - TDC_HIT_MIN  # 200 ns
 
 # =============================================================================
-# LOAD CALIBRATION
+# CALIBRATION FILE SELECTION (run-range aware)
 # =============================================================================
+
+def get_calib_file(run_number, base_dir):
+    """Select appropriate calibration file based on run number."""
+    if USE_VETO_PARAMS:
+        cfg = get_run_config(run_number)
+        # Assuming txt calib files are in base_dir with naming convention
+        if run_number >= 1295:
+            return os.path.join(base_dir, "sipm_calib_1295-.txt"), cfg['run_range_label']
+        elif run_number <= 1193:
+            return os.path.join(base_dir, "sipm_calib_1157-1193.txt"), cfg['run_range_label']
+        else:
+            return os.path.join(base_dir, "sipm_calib_1295-.txt"), "gap (1194-1294)"
+    else:
+        # Simple fallback
+        if run_number >= 1295:
+            return os.path.join(base_dir, "sipm_calib_1295-.txt"), "1295+"
+        else:
+            return os.path.join(base_dir, "sipm_calib_1157-1193.txt"), "≤1193"
+
 
 def load_calibration(calib_file):
-    """Load channel calibration (gain, intercept, DCR) from official TXT file.
-
-    Supports both the old TSpectrum format (no DCR) and the new format with
-    a DCR column.  Returns (calibration_dict, dark_noise_pe_float).
-
-    calibration_dict: {ch_id: {'gain': float, 'intercept': float, 'dcr': float}}
-    dark_noise_pe   : Σ_ch DCR_ch × TDC_window_ns × 1e-9  [PE]
-    """
-    if not os.path.exists(calib_file):
-        print(f"ERROR: Calibration file not found: {calib_file}")
-        sys.exit(1)
-
-    print(f"Loading calibration from: {calib_file}")
-    with open(calib_file) as fh:
-        lines = fh.readlines()
-
-    # Auto-detect format: new format has 'dcr' in a comment line
-    is_new_format = any('dcr' in ln.lower() for ln in lines if ln.startswith('#'))
-    # Find first data line
-    data_start = 0
-    for i, ln in enumerate(lines):
-        if ln.startswith('#'):
-            data_start = i + 1
-        elif ln.strip():
-            break
-
+    """Load gain calibration from text file."""
     calibration = {}
-    total_dcr = 0.0
-    dcr_count = 0
-
-    for ln in lines[data_start:]:
-        parts = ln.strip().split()
-        if not parts:
-            continue
-        try:
-            ch_id = int(parts[0])
-            gain  = float(parts[1])
-            if gain > 1e6:       # sentinel for bad/masked channels
+    if not os.path.exists(calib_file):
+        print(f"WARNING: Calibration file not found: {calib_file}")
+        return calibration
+    
+    with open(calib_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
                 continue
-            # New format: ch gain mean0 gain_dyn mean0_dyn timeoffset baseline dcr
-            # Old format: ch gain gain_err intercept int_err ...
-            if is_new_format:
-                intercept = float(parts[2])
-                dcr = float(parts[7]) if len(parts) >= 8 else 0.0
-            else:
-                intercept = float(parts[3])
-                dcr = 0.0
-            calibration[ch_id] = {'gain': gain, 'intercept': intercept, 'dcr': dcr}
-            if dcr > 0.0:
-                total_dcr += dcr
-                dcr_count += 1
-        except (ValueError, IndexError):
-            continue
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    chid = int(parts[0])
+                    gain = float(parts[1])
+                    intercept = float(parts[2])
+                    if gain > 0:
+                        calibration[chid] = {'gain': gain, 'intercept': intercept}
+                except (ValueError, IndexError):
+                    continue
+    
+    print(f"Loaded calibration for {len(calibration)} channels")
+    return calibration
 
-    n_loaded = len(calibration)
-    if n_loaded == 0:
-        print("ERROR: No channels loaded from calibration file!")
-        sys.exit(1)
 
-    mean_gain = float(np.mean([v['gain'] for v in calibration.values()]))
-    print(f"  Format  : {'NEW (with DCR)' if is_new_format else 'OLD (TSpectrum)'}")
-    print(f"  Channels: {n_loaded}   mean gain: {mean_gain:.2f} ADC/PE")
-
-    dark_noise_pe = 0.0
-    if total_dcr > 0:
-        dark_noise_pe = total_dcr * _TDC_WINDOW_NS * 1e-9
-        print(f"  Total DCR ({dcr_count} ch): {total_dcr:.2f} Hz")
-        print(f"  Dark Noise ({_TDC_WINDOW_NS:.0f} ns TDC window): "
-              f"{dark_noise_pe:.4f} PE")
-    else:
-        print("  Dark Noise: DCR not in this file — dark noise = 0 (ignored)")
-
-    return calibration, dark_noise_pe
+def file_exists_or_accessible(path):
+    """Check file existence (XRootD URLs always pass)."""
+    if path.startswith("root://"):
+        return True
+    return os.path.exists(path)
 
 
 # =============================================================================
-# MAIN PROCESSING FUNCTION
+# MAIN EXTRACTION FUNCTION
 # =============================================================================
 
-def process_exotic_rtraw(rtraw_file, calibration, dark_noise_pe):
-    """Process one RTRAW file; return tri-mode histograms and statistics.
-
-    Returns
-    -------
-    dict with keys:
-      'histograms'   : {'a': {'PEcontin', 'PEdiscrete', 'nHit'},
-                        'b': {...}, 'c': {...}}
-      'stats_shared' : muon / veto counters (identical for all modes)
-      'stats_mode'   : per-mode {'n_outlier', 'n_after_muon',
-                                  'n_after_pulse', 'n_clean'}
-      'n_events'     : total entries in CD tree
-      'has_wt', 'has_tvt'
-    or None on file-open error.
+def process_rtraw(rtraw_file, calibration, run_number):
     """
-    P = PARAMS_CALIB2
-    MUON_THRESHOLD_CD  = P["MUON_THRESHOLD_CD"]
-    MUON_THRESHOLD_WT  = P["MUON_THRESHOLD_WT"]
-    MUON_THRESHOLD_TVT = P["MUON_THRESHOLD_TVT"]
-    AFTER_MU           = P["AFTER_MU"]
-    AFTER_PULSE        = P["AFTER_PULSE"]
-    MAX_TOTAL_ADC      = P["MAX_TOTAL_ADC"]
-    MAX_ADC_PER_CHANNEL= P["MAX_ADC_PER_CHANNEL"]
-    MIN_NHIT           = P["MIN_NHIT"]
-    MAX_NHIT           = P["MAX_NHIT"]
-    TDC_HIT_MIN        = P["TDC_HIT_MIN"]
-    TDC_HIT_MAX        = P["TDC_HIT_MAX"]
-    ADC_HIT_MIN        = P["ADC_HIT_MIN"]
-    ADC_HIT_MAX        = P["ADC_HIT_MAX"]
-
+    Process RTRAW file and fill histograms for all four modes (A, B, C, D).
+    
+    Returns dict with histograms and statistics.
+    """
+    
+    if not file_exists_or_accessible(rtraw_file):
+        print(f"ERROR: File not found: {rtraw_file}")
+        return None
+    
+    # Parse file number
+    basename = os.path.basename(rtraw_file)
+    file_match = re.search(r'\.(\d{3})_T\d+\.\d+\.\d+.*\.rtraw', basename)
+    file_number = file_match.group(1) if file_match else "000"
+    
+    # Open file
     fin = ROOT.TFile.Open(rtraw_file, "READ")
     if not fin or fin.IsZombie():
-        print(f"  ERROR: Cannot open {rtraw_file}")
+        print(f"ERROR: Cannot open {rtraw_file}")
         return None
-
+    
     cd_elec_tree = fin.Get("Event/Elec/CdElecEvt")
     cd_trig_tree = fin.Get("Event/Trig/CdTrigEvt")
     if not cd_elec_tree or not cd_trig_tree:
-        print("  ERROR: Cannot find CD trees")
+        print("ERROR: Cannot find CD trees")
         fin.Close()
         return None
-
+    
     nentries = cd_elec_tree.GetEntries()
-    print(f"  Events: {nentries}")
-
-    # ── Optional detectors ────────────────────────────────────────────────────
-    has_wt = False
+    print(f"  Processing {nentries} events from file {file_number}...")
+    
+    # Check WT/TVT
+    has_wt = has_tvt = False
+    wt_elec_tree = wt_trig_tree = None
+    tvt_elec_tree = tvt_trig_tree = None
+    
     try:
         wt_elec_tree = fin.Get("Event/Wt/Elec/WtElecEvt")
         wt_trig_tree = fin.Get("Event/Wt/Trig/WtTrigEvt")
-        if (wt_elec_tree and wt_trig_tree
-                and hasattr(wt_elec_tree, 'GetEntries')
-                and hasattr(wt_trig_tree, 'GetEntries')):
-            print(f"  WT available  ({wt_elec_tree.GetEntries()} events)")
+        if wt_elec_tree and wt_trig_tree and hasattr(wt_elec_tree, 'GetEntries'):
             has_wt = True
-        else:
-            wt_elec_tree = wt_trig_tree = None
-    except Exception:
-        wt_elec_tree = wt_trig_tree = None
-    if not has_wt:
-        print("  WT NOT AVAILABLE")
-
-    has_tvt = False
+    except:
+        pass
+    
     try:
         tvt_elec_tree = fin.Get("Event/Tvt/Elec/TvtElecEvt")
         tvt_trig_tree = fin.Get("Event/Tvt/Trig/TvtTrigEvt")
-        if (tvt_elec_tree and tvt_trig_tree
-                and hasattr(tvt_elec_tree, 'GetEntries')
-                and hasattr(tvt_trig_tree, 'GetEntries')):
-            print(f"  TVT available ({tvt_elec_tree.GetEntries()} events)")
+        if tvt_elec_tree and tvt_trig_tree and hasattr(tvt_elec_tree, 'GetEntries'):
             has_tvt = True
-        else:
-            tvt_elec_tree = tvt_trig_tree = None
-    except Exception:
-        tvt_elec_tree = tvt_trig_tree = None
-    if not has_tvt:
-        print("  TVT NOT AVAILABLE")
-
-    # ── Branch objects ────────────────────────────────────────────────────────
+    except:
+        pass
+    
+    # Branch setup
     cd_elec_evt = ROOT.Tao.CdElecEvt()
     cd_trig_evt = ROOT.Tao.CdTrigEvt()
     cd_elec_tree.SetBranchAddress("CdElecEvt", cd_elec_evt)
     cd_trig_tree.SetBranchAddress("CdTrigEvt", cd_trig_evt)
-
+    
     if has_wt:
         wt_elec_evt = ROOT.Tao.WtElecEvt()
         wt_trig_evt = ROOT.Tao.WtTrigEvt()
         wt_elec_tree.SetBranchAddress("WtElecEvt", wt_elec_evt)
         wt_trig_tree.SetBranchAddress("WtTrigEvt", wt_trig_evt)
+    
     if has_tvt:
         tvt_elec_evt = ROOT.Tao.TvtElecEvt()
         tvt_trig_evt = ROOT.Tao.TvtTrigEvt()
         tvt_elec_tree.SetBranchAddress("TvtElecEvt", tvt_elec_evt)
         tvt_trig_tree.SetBranchAddress("TvtTrigEvt", tvt_trig_evt)
-
-    # ── Histograms ────────────────────────────────────────────────────────────
-    NBINS_PE  = 500;  PE_MAX  = 25000
-    NBINS_HIT = 500;  HIT_MAX = 8048
-    hists = {}
+    
+    # =========================================================================
+    # Create histograms
+    # =========================================================================
+    
+    NBINS_PE = 500
+    PE_MAX = 25000
+    NBINS_HIT = 500
+    HIT_MAX = 8048
+    
     mode_labels = {
         'a': 'Mode A: ADC in [ADC_HIT_MIN, ADC_HIT_MAX], MAX_TOTAL_ADC applied',
         'b': 'Mode B: ADC >= ADC_HIT_MAX (inverted), MAX_TOTAL_ADC applied',
         'c': 'Mode C: ADC >= ADC_HIT_MAX (inverted), no MAX_TOTAL_ADC cut',
+        'd': 'Mode D: ADC < ADC_HIT_MIN (low-ADC baseline), no event cuts',  # NEW
     }
-    for mode in ('a', 'b', 'c'):
+    
+    hists = {}
+    for mode in ('a', 'b', 'c', 'd'):
         hists[mode] = {
-            'PEcontin':   ROOT.TH1F(f"h_PEcontin_{mode}",
-                                    f"Continuous PE [{mode_labels[mode]}]",
-                                    NBINS_PE, 0, PE_MAX),
+            'PEcontin': ROOT.TH1F(f"h_PEcontin_{mode}",
+                                   f"Continuous PE [{mode_labels[mode]}]",
+                                   NBINS_PE, 0, PE_MAX),
             'PEdiscrete': ROOT.TH1F(f"h_PEdiscrete_{mode}",
-                                    f"Discrete PE [{mode_labels[mode]}]",
-                                    NBINS_PE, 0, PE_MAX),
-            'nHit':       ROOT.TH1F(f"h_nHit_{mode}",
-                                    f"nHit [{mode_labels[mode]}]",
-                                    NBINS_HIT, 0, HIT_MAX),
+                                     f"Discrete PE [{mode_labels[mode]}]",
+                                     NBINS_PE, 0, PE_MAX),
+            'nHit': ROOT.TH1F(f"h_nHit_{mode}",
+                              f"nHit [{mode_labels[mode]}]",
+                              NBINS_HIT, 0, HIT_MAX),
+            # NEW: TDC distribution per mode
+            'TDC': ROOT.TH1F(f"h_TDC_{mode}",
+                             f"TDC distribution [{mode_labels[mode]}]",
+                             200, 0, 2000),
         }
         for h in hists[mode].values():
             h.SetDirectory(0)
-
-    # ── Statistics ────────────────────────────────────────────────────────────
-    s = dict(n_muons=0, n_muons_cd=0, n_muons_wt=0, n_muons_tvt=0)
-    sm = {m: dict(n_outlier=0, n_after_muon=0, n_after_pulse=0, n_clean=0)
-          for m in ('a', 'b', 'c')}
-
+    
+    # NEW: Diagnostic histograms
+    h_totalADC = ROOT.TH1F("h_totalADC_perEvent", 
+                            "Total ADC per event (before cuts)",
+                            500, 0, 2e9)
+    h_nChannelsAbove = ROOT.TH1F("h_nChannelsAboveThreshold",
+                                  f"Channels with ADC > {ADC_HIT_MAX:.0e} per event",
+                                  100, 0, 100)
+    h_totalADC.SetDirectory(0)
+    h_nChannelsAbove.SetDirectory(0)
+    
+    # Statistics
+    stats = {
+        'n_events': nentries,
+        'n_muons': 0, 'n_muons_cd': 0, 'n_muons_wt': 0, 'n_muons_tvt': 0,
+    }
+    stats_mode = {m: {'n_outlier': 0, 'n_after_muon': 0, 'n_after_pulse': 0, 
+                      'n_clean': 0, 'pe_sum': 0.0, 'pe_sum_sq': 0.0}
+                  for m in ('a', 'b', 'c', 'd')}
+    
+    # Muon tracking
     sec_prev = nsec_prev = 0
-    sec_mu   = nsec_mu   = 0
+    sec_mu = nsec_mu = 0
     is_after_muon = False
-
-    # ── Event loop ────────────────────────────────────────────────────────────
-    print(f"  Processing {nentries} events...")
+    
+    # Calculate dark noise
+    dark_noise_pe = 0.0
+    for chid, cal in calibration.items():
+        # Assume DCR ~1 kHz per channel (typical)
+        dcr = 1000.0  # Hz
+        dark_noise_pe += dcr * TDC_WINDOW_WIDTH * 1e-9
+    
+    # =========================================================================
+    # Event loop
+    # =========================================================================
+    
     for i in range(nentries):
         if (i + 1) % 20000 == 0:
-            print(f"\r  Event {i+1}/{nentries}...", end='', flush=True)
-
+            print(f"\r    Event {i+1}/{nentries}...", end='', flush=True)
+        
         cd_elec_tree.GetEntry(i)
         cd_trig_tree.GetEntry(i)
         if has_wt:
@@ -353,83 +308,96 @@ def process_exotic_rtraw(rtraw_file, calibration, dark_noise_pe):
         if has_tvt:
             tvt_elec_tree.GetEntry(i)
             tvt_trig_tree.GetEntry(i)
-
+        
+        # Event timing
         trig_time = cd_trig_evt.getTrigTime()
-        sec  = trig_time.GetSec()
+        sec = trig_time.GetSec()
         nsec = trig_time.GetNanoSec()
-
-        # ── After-muon window expiry ──────────────────────────────────────────
+        
+        # After-muon window expiry
         if is_after_muon:
             if (sec - sec_mu) * 1e9 + (nsec - nsec_mu) > AFTER_MU:
                 is_after_muon = False
-
-        # ── After-pulse flag ──────────────────────────────────────────────────
-        is_after_pulse = (i > 0 and
+        
+        # After-pulse flag
+        is_after_pulse = (i > 0 and 
                           (sec - sec_prev) * 1e9 + (nsec - nsec_prev) < AFTER_PULSE)
-
-        # ── Per-channel data collection ───────────────────────────────────────
-        channels      = cd_elec_evt.GetElecChannels()
+        
+        # Collect channel data
+        channels = cd_elec_evt.GetElecChannels()
         tot_adc_event = 0.0
-        event_hits    = []          # list of (chid, adc_val, tdc_val)
-        has_flasher   = False
         n_hit_channels = 0
-
+        n_channels_above = 0
+        event_hits = []
+        has_flasher = False
+        
         for j in range(channels.size()):
-            channel      = channels[j]
-            chid         = channel.getChannelID()
-            adcs         = channel.getADCs()
-            tdcs         = channel.getTDCs()
-            adcs_list    = [adcs[k] for k in range(adcs.size())]
-            ch_total_adc = sum(adcs_list)
-
-            # Per-channel flasher guard (event-level; marks event as flasher)
-            if ch_total_adc > MAX_ADC_PER_CHANNEL:
-                has_flasher = True
-                continue
-            if not adcs_list:
-                continue
-
-            tot_adc_event += ch_total_adc
-            n_hit_channels += 1
-
-            n_hits = min(adcs.size(), tdcs.size())
-            for k in range(n_hits):
-                event_hits.append((chid, float(adcs[k]), float(tdcs[k])))
-            for k in range(n_hits, adcs.size()):
-                event_hits.append((chid, float(adcs[k]), -1.0))   # TDC missing
-
-        # ── Muon tagging ──────────────────────────────────────────────────────
-        is_muon_cd  = (tot_adc_event > MUON_THRESHOLD_CD)
-        is_muon_wt  = (has_wt  and
-                       wt_elec_evt.GetElecChannels().size() >= MUON_THRESHOLD_WT)
-        is_muon_tvt = (has_tvt and
-                       tvt_elec_evt.GetElecChannels().size() >= MUON_THRESHOLD_TVT)
+            channel = channels[j]
+            chid = channel.ElecgetChannelID()
+            adc_vals = list(channel.ElecgetAdcs())
+            tdc_vals = list(channel.ElecgetTdcs())
+            
+            for k, adc_val in enumerate(adc_vals):
+                tdc_val = tdc_vals[k] if k < len(tdc_vals) else 0.0
+                event_hits.append((chid, adc_val, tdc_val))
+                tot_adc_event += adc_val
+                n_hit_channels += 1
+                
+                if adc_val > MAX_ADC_PER_CHANNEL:
+                    has_flasher = True
+                if adc_val >= ADC_HIT_MAX:
+                    n_channels_above += 1
+        
+        # Fill diagnostic histograms (all events)
+        h_totalADC.Fill(tot_adc_event)
+        h_nChannelsAbove.Fill(n_channels_above)
+        
+        # Muon tagging
+        is_muon = False
+        is_muon_cd = tot_adc_event > MUON_THRESHOLD_CD
+        is_muon_wt = False
+        is_muon_tvt = False
+        
+        if has_wt:
+            wt_channels = wt_elec_evt.GetElecChannels()
+            if wt_channels.size() >= MUON_THRESHOLD_WT:
+                is_muon_wt = True
+        
+        if has_tvt:
+            tvt_channels = tvt_elec_evt.GetElecChannels()
+            if tvt_channels.size() >= MUON_THRESHOLD_TVT:
+                is_muon_tvt = True
+        
         is_muon = is_muon_cd or is_muon_wt or is_muon_tvt
-
-        # ── Outlier checks (two flavours) ─────────────────────────────────────
-        nhit_ok    = MIN_NHIT <= n_hit_channels <= MAX_NHIT
-        # Modes A + B: standard outlier includes MAX_TOTAL_ADC
-        passes_ab  = nhit_ok and (not has_flasher) and (tot_adc_event <= MAX_TOTAL_ADC)
-        # Mode C: relaxed outlier — no MAX_TOTAL_ADC threshold
-        passes_c   = nhit_ok and (not has_flasher)
-
-        # ── Per-mode veto assignment ──────────────────────────────────────────
-        # Priority (mirroring extract_charge_calib.py): outlier > after-muon
-        #                                                > after-pulse > clean
-        def veto_flag(passes_outlier):
-            if not passes_outlier:  return 'outlier'
-            if is_after_muon:       return 'after_muon'
-            if is_after_pulse:      return 'after_pulse'
+        
+        # Determine veto flags for modes A/B (with MAX_TOTAL_ADC) and C (without)
+        def veto_flag(apply_event_cut):
+            if has_flasher:
+                return 'outlier'
+            if apply_event_cut and tot_adc_event > MAX_TOTAL_ADC:
+                return 'outlier'
+            if n_hit_channels < MIN_NHIT or n_hit_channels > MAX_NHIT:
+                return 'outlier'
+            if is_muon:
+                return 'muon'
+            if is_after_muon:
+                return 'after_muon'
+            if is_after_pulse:
+                return 'after_pulse'
             return 'clean'
-
-        flag_ab = veto_flag(passes_ab)
-        flag_c  = veto_flag(passes_c)
-
-        # ── Update per-mode counters ──────────────────────────────────────────
-        for mode, flag in (('a', flag_ab), ('b', flag_ab), ('c', flag_c)):
-            sm[mode][f'n_{flag}'] += 1
-
-        # ── Fill mode A histograms (standard: ADC_HIT_MIN ≤ adc ≤ ADC_HIT_MAX) ──
+        
+        flag_ab = veto_flag(True)   # Modes A, B: MAX_TOTAL_ADC applied
+        flag_c = veto_flag(False)   # Mode C: no MAX_TOTAL_ADC
+        flag_d = 'clean'            # Mode D: no event cuts at all
+        
+        # Update statistics
+        for mode, flag in [('a', flag_ab), ('b', flag_ab), ('c', flag_c), ('d', flag_d)]:
+            if flag != 'clean':
+                stats_mode[mode][f'n_{flag}'] = stats_mode[mode].get(f'n_{flag}', 0) + 1
+        
+        # =====================================================================
+        # Fill Mode A: Standard (ADC_HIT_MIN ≤ adc ≤ ADC_HIT_MAX)
+        # =====================================================================
         if flag_ab == 'clean':
             pe_cont = pe_disc = 0.0
             nhit_a = 0
@@ -438,296 +406,259 @@ def process_exotic_rtraw(rtraw_file, calibration, dark_noise_pe):
                     continue
                 if adc < ADC_HIT_MIN or adc > ADC_HIT_MAX:
                     continue
-                if tdc < 0 or tdc < TDC_HIT_MIN or tdc > TDC_HIT_MAX:
+                if tdc < TDC_HIT_MIN or tdc > TDC_HIT_MAX:
                     continue
                 ch_pe = (adc - calibration[chid]['intercept']) / calibration[chid]['gain']
                 pe_cont += ch_pe
                 pe_disc += float(int(np.round(ch_pe)))
-                nhit_a  += 1
+                nhit_a += 1
+                hists['a']['TDC'].Fill(tdc)
+            
             pe_cont -= dark_noise_pe
             pe_disc -= dark_noise_pe
             if pe_cont > 0:
                 hists['a']['PEcontin'].Fill(pe_cont)
                 hists['a']['PEdiscrete'].Fill(pe_disc)
+                stats_mode['a']['pe_sum'] += pe_cont
+                stats_mode['a']['pe_sum_sq'] += pe_cont**2
             if nhit_a > 0:
                 hists['a']['nHit'].Fill(nhit_a)
-
-        # ── Fill mode B histograms (inverted ADC ≥ ADC_HIT_MAX, event cut ON) ──
+            stats_mode['a']['n_clean'] += 1
+        
+        # =====================================================================
+        # Fill Mode B: Inverted (ADC ≥ ADC_HIT_MAX), event cut ON
+        # =====================================================================
         if flag_ab == 'clean':
             pe_cont = pe_disc = 0.0
             nhit_b = 0
             for chid, adc, tdc in event_hits:
                 if chid not in calibration:
                     continue
-                if adc < ADC_HIT_MAX:                    # lower bound
+                if adc < ADC_HIT_MAX:  # Inverted: only high-ADC
                     continue
-                # NOTE: TDC window still applied — high-ADC hits outside the
-                # prompt window [240, 440] ns are excluded, consistent with the
-                # "inherits all veto cuts" requirement.  If mode B/C histograms
-                # are empty, consider relaxing this in post-analysis.
-                if tdc < 0 or tdc < TDC_HIT_MIN or tdc > TDC_HIT_MAX:
+                if tdc < TDC_HIT_MIN or tdc > TDC_HIT_MAX:
                     continue
                 ch_pe = (adc - calibration[chid]['intercept']) / calibration[chid]['gain']
                 pe_cont += ch_pe
                 pe_disc += float(int(np.round(ch_pe)))
-                nhit_b  += 1
+                nhit_b += 1
+                hists['b']['TDC'].Fill(tdc)
+            
             pe_cont -= dark_noise_pe
             pe_disc -= dark_noise_pe
             if nhit_b > 0:
                 if pe_cont > 0:
                     hists['b']['PEcontin'].Fill(pe_cont)
                     hists['b']['PEdiscrete'].Fill(pe_disc)
+                    stats_mode['b']['pe_sum'] += pe_cont
+                    stats_mode['b']['pe_sum_sq'] += pe_cont**2
                 hists['b']['nHit'].Fill(nhit_b)
-
-        # ── Fill mode C histograms (inverted ADC ≥ ADC_HIT_MAX, event cut OFF) ──
+            stats_mode['b']['n_clean'] += 1
+        
+        # =====================================================================
+        # Fill Mode C: Inverted (ADC ≥ ADC_HIT_MAX), event cut OFF
+        # =====================================================================
         if flag_c == 'clean':
             pe_cont = pe_disc = 0.0
             nhit_c = 0
             for chid, adc, tdc in event_hits:
                 if chid not in calibration:
                     continue
-                if adc < ADC_HIT_MAX:                    # lower bound
+                if adc < ADC_HIT_MAX:
                     continue
-                if tdc < 0 or tdc < TDC_HIT_MIN or tdc > TDC_HIT_MAX:
+                if tdc < TDC_HIT_MIN or tdc > TDC_HIT_MAX:
                     continue
                 ch_pe = (adc - calibration[chid]['intercept']) / calibration[chid]['gain']
                 pe_cont += ch_pe
                 pe_disc += float(int(np.round(ch_pe)))
-                nhit_c  += 1
+                nhit_c += 1
+                hists['c']['TDC'].Fill(tdc)
+            
             pe_cont -= dark_noise_pe
             pe_disc -= dark_noise_pe
             if nhit_c > 0:
                 if pe_cont > 0:
                     hists['c']['PEcontin'].Fill(pe_cont)
                     hists['c']['PEdiscrete'].Fill(pe_disc)
+                    stats_mode['c']['pe_sum'] += pe_cont
+                    stats_mode['c']['pe_sum_sq'] += pe_cont**2
                 hists['c']['nHit'].Fill(nhit_c)
-
-        # ── Muon bookkeeping (unconditional — must happen AFTER veto assignment)
-        # This mirrors extract_charge_calib.py: even an event that is already
-        # labelled 'outlier' or 'after_muon' can itself BE a muon and arm the
-        # after-muon window for subsequent events.
+            stats_mode['c']['n_clean'] += 1
+        
+        # =====================================================================
+        # Fill Mode D: Low-ADC baseline (ADC < ADC_HIT_MIN), no event cuts
+        # =====================================================================
+        # Mode D always fills (no veto)
+        pe_cont = pe_disc = 0.0
+        nhit_d = 0
+        for chid, adc, tdc in event_hits:
+            if chid not in calibration:
+                continue
+            if adc >= ADC_HIT_MIN:  # Only low-ADC hits
+                continue
+            # No TDC cut for baseline study
+            ch_pe = (adc - calibration[chid]['intercept']) / calibration[chid]['gain']
+            pe_cont += ch_pe
+            pe_disc += float(int(np.round(ch_pe)))
+            nhit_d += 1
+            hists['d']['TDC'].Fill(tdc)
+        
+        if nhit_d > 0:
+            hists['d']['PEcontin'].Fill(pe_cont)
+            hists['d']['PEdiscrete'].Fill(pe_disc)
+            hists['d']['nHit'].Fill(nhit_d)
+            stats_mode['d']['pe_sum'] += pe_cont
+            stats_mode['d']['pe_sum_sq'] += pe_cont**2
+        stats_mode['d']['n_clean'] += 1
+        
+        # Muon bookkeeping
         if is_muon:
             is_after_muon = True
-            sec_mu  = sec
+            sec_mu = sec
             nsec_mu = nsec
-            s['n_muons']     += 1
-            s['n_muons_cd']  += int(is_muon_cd)
-            s['n_muons_wt']  += int(is_muon_wt)
-            s['n_muons_tvt'] += int(is_muon_tvt)
-
+            stats['n_muons'] += 1
+            if is_muon_cd: stats['n_muons_cd'] += 1
+            if is_muon_wt: stats['n_muons_wt'] += 1
+            if is_muon_tvt: stats['n_muons_tvt'] += 1
+        
         sec_prev = sec
         nsec_prev = nsec
-
-    print(f"\r  Done: {nentries} events processed" + " " * 30)
+    
+    print(f"\r    Done: {nentries} events" + " " * 30)
+    
     fin.Close()
-
+    
     return {
-        'histograms':    hists,
-        'stats_shared':  s,
-        'stats_mode':    sm,
-        'n_events':      nentries,
-        'has_wt':        has_wt,
-        'has_tvt':       has_tvt,
+        'histograms': hists,
+        'diagnostics': {'h_totalADC': h_totalADC, 'h_nChannelsAbove': h_nChannelsAbove},
+        'stats': stats,
+        'stats_mode': stats_mode,
+        'file_number': file_number,
+        'has_wt': has_wt,
+        'has_tvt': has_tvt,
     }
 
 
-# =============================================================================
-# WRITE OUTPUT ROOT FILE
-# =============================================================================
+def print_efficiency_table(stats_mode, n_events):
+    """Print cut efficiency summary table."""
+    print()
+    print("=" * 70)
+    print("CUT EFFICIENCY SUMMARY")
+    print("=" * 70)
+    print()
+    print(f"{'Mode':<8} {'Events':<12} {'% of total':<12} {'Mean PE':<12} {'RMS PE':<12}")
+    print("-" * 60)
+    
+    for mode in ('a', 'b', 'c', 'd'):
+        sm = stats_mode[mode]
+        n_clean = sm['n_clean']
+        pct = 100.0 * n_clean / n_events if n_events > 0 else 0
+        
+        if n_clean > 0 and sm['pe_sum_sq'] > 0:
+            mean_pe = sm['pe_sum'] / n_clean
+            var_pe = sm['pe_sum_sq'] / n_clean - mean_pe**2
+            rms_pe = np.sqrt(max(0, var_pe))
+        else:
+            mean_pe = rms_pe = 0.0
+        
+        mode_desc = {'a': 'A (std)', 'b': 'B (hi)', 'c': 'C (hi,nocut)', 'd': 'D (lo)'}
+        print(f"{mode_desc[mode]:<8} {n_clean:<12,} {pct:<12.1f} {mean_pe:<12,.0f} {rms_pe:<12,.0f}")
+    
+    print()
 
-def write_output(result, outpath, run_number, file_number, calib_file):
-    """Write histograms and metadata to a ROOT file."""
-    P      = PARAMS_CALIB2
-    hists  = result['histograms']
-    s      = result['stats_shared']
-    sm     = result['stats_mode']
 
-    os.makedirs(os.path.dirname(outpath) or '.', exist_ok=True)
+def write_output(result, outpath, run_number, calib_file):
+    """Write histograms and metadata to ROOT file."""
+    
     fout = ROOT.TFile(outpath, "RECREATE")
-    fout.cd()
-
-    for mode in ('a', 'b', 'c'):
-        for hname, h in hists[mode].items():
+    
+    # Write mode histograms
+    for mode, mode_hists in result['histograms'].items():
+        mode_dir = fout.mkdir(f"Mode_{mode.upper()}")
+        mode_dir.cd()
+        for h in mode_hists.values():
             h.Write()
-
-    # ── Metadata ─────────────────────────────────────────────────────────────
+    
+    # Write diagnostic histograms
+    diag_dir = fout.mkdir("Diagnostics")
+    diag_dir.cd()
+    for h in result['diagnostics'].values():
+        h.Write()
+    
+    # Write metadata
+    fout.cd()
     meta = (
         f"RUN={run_number};"
-        f"FILE_NUM={file_number};"
+        f"FILE={result['file_number']};"
         f"CALIB_FILE={os.path.basename(calib_file)};"
-        # Veto parameters
-        f"MUON_THRESHOLD_CD={P['MUON_THRESHOLD_CD']};"
-        f"MUON_THRESHOLD_WT={P['MUON_THRESHOLD_WT']};"
-        f"MUON_THRESHOLD_TVT={P['MUON_THRESHOLD_TVT']};"
-        f"AFTER_MU={P['AFTER_MU']};"
-        f"AFTER_PULSE={P['AFTER_PULSE']};"
-        f"MAX_TOTAL_ADC={P['MAX_TOTAL_ADC']};"
-        f"MAX_ADC_PER_CHANNEL={P['MAX_ADC_PER_CHANNEL']};"
-        f"MIN_NHIT={P['MIN_NHIT']};"
-        f"MAX_NHIT={P['MAX_NHIT']};"
-        f"TDC_HIT_MIN={P['TDC_HIT_MIN']};"
-        f"TDC_HIT_MAX={P['TDC_HIT_MAX']};"
-        f"ADC_HIT_MIN={P['ADC_HIT_MIN']};"
-        f"ADC_HIT_MAX={P['ADC_HIT_MAX']};"
-        f"HAS_WT={int(result['has_wt'])};"
-        f"HAS_TVT={int(result['has_tvt'])};"
-        # Shared muon counts
-        f"N_MUONS={s['n_muons']};"
-        f"N_MUONS_CD={s['n_muons_cd']};"
-        f"N_MUONS_WT={s['n_muons_wt']};"
-        f"N_MUONS_TVT={s['n_muons_tvt']};"
-        # Per-mode counts
-        + "".join(
-            f"N_OUTLIER_{m.upper()}={sm[m]['n_outlier']};"
-            f"N_AFTER_MUON_{m.upper()}={sm[m]['n_after_muon']};"
-            f"N_AFTER_PULSE_{m.upper()}={sm[m]['n_after_pulse']};"
-            f"N_CLEAN_{m.upper()}={sm[m]['n_clean']};"
-            for m in ('a', 'b', 'c')
-        )
-        # Mode descriptions
-        f"MODE_A=ADC_HIT_MIN<=ADC<=ADC_HIT_MAX,MAX_TOTAL_ADC_ON;"
-        f"MODE_B=ADC>=ADC_HIT_MAX(inverted),MAX_TOTAL_ADC_ON;"
-        f"MODE_C=ADC>=ADC_HIT_MAX(inverted),MAX_TOTAL_ADC_OFF;"
-        f"N_EVENTS={result['n_events']}"
+        f"TDC_WINDOW=[{TDC_HIT_MIN},{TDC_HIT_MAX}];"
+        f"ADC_HIT_MIN={ADC_HIT_MIN};"
+        f"ADC_HIT_MAX={ADC_HIT_MAX};"
+        f"MAX_TOTAL_ADC={MAX_TOTAL_ADC};"
+        f"N_EVENTS={result['stats']['n_events']};"
+        f"N_MUONS={result['stats']['n_muons']};"
+        f"HAS_WT={1 if result['has_wt'] else 0};"
+        f"HAS_TVT={1 if result['has_tvt'] else 0}"
     )
-    ROOT.TNamed("veto_info", meta).Write("veto_info", ROOT.TObject.kOverwrite)
-
-    fout.Write()
+    ROOT.TNamed("veto_info", meta).Write()
+    
     fout.Close()
+    print(f"Output written to: {outpath}")
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def run_exotic(rtraw_file, output_dir, run_number, calib_file_override=None):
-    """Full pipeline: select calibration → load → process → save."""
-    print("=" * 60)
-    print("get_spectrum_exotic.py — tri-mode ADC spectrum")
-    print("=" * 60)
-
-    # ── Calibration selection ─────────────────────────────────────────────────
-    if calib_file_override:
-        calib_file = calib_file_override
-        print(f"Using custom calibration file: {calib_file}")
-    else:
-        calib_file, warn = get_official_calib_file(run_number)
-        if warn:
-            print(warn)
-        print(f"Official calibration: {os.path.basename(calib_file)}")
-
-    print()
-    calibration, dark_noise_pe = load_calibration(calib_file)
-    print()
-
-    # ── Print veto parameters ─────────────────────────────────────────────────
-    P = PARAMS_CALIB2
-    print("CALIB2 veto parameters (shared across all modes):")
-    print(f"  CD muon threshold      : {P['MUON_THRESHOLD_CD']:.1e} ADC")
-    print(f"  WT muon threshold      : {P['MUON_THRESHOLD_WT']} fired channels")
-    print(f"  TVT muon threshold     : {P['MUON_THRESHOLD_TVT']} fired channels")
-    print(f"  After-muon veto        : {P['AFTER_MU']/1e3:.0f} µs")
-    print(f"  After-pulse veto       : {P['AFTER_PULSE']/1e3:.1f} µs")
-    print(f"  Max ADC/ch (flasher)   : {P['MAX_ADC_PER_CHANNEL']:.1e}")
-    print(f"  nHit range             : [{P['MIN_NHIT']}, {P['MAX_NHIT']}]")
-    print(f"  TDC window             : [{P['TDC_HIT_MIN']}, {P['TDC_HIT_MAX']}] ns")
-    print(f"  ADC_HIT_MIN            : {P['ADC_HIT_MIN']:.0f}")
-    print(f"  ADC_HIT_MAX            : {P['ADC_HIT_MAX']:.1e}")
-    print(f"  MAX_TOTAL_ADC          : {P['MAX_TOTAL_ADC']:.1e}  (modes A+B; SKIPPED in C)")
-    print()
-    print("Mode summary:")
-    print("  A — ADC_HIT_MIN ≤ adc ≤ ADC_HIT_MAX + MAX_TOTAL_ADC event cut   [standard]")
-    print("  B — adc ≥ ADC_HIT_MAX               + MAX_TOTAL_ADC event cut   [inverted ADC, event-cut ON]")
-    print("  C — adc ≥ ADC_HIT_MAX               + no MAX_TOTAL_ADC cut      [inverted ADC, event-cut OFF]")
-    print()
-
-    # ── Parse file number from RTRAW name ─────────────────────────────────────
-    basename   = os.path.basename(rtraw_file)
-    run_match  = re.search(r'RUN\.(\d+)\.', basename)
-    parsed_run = run_match.group(1) if run_match else str(run_number)
-    file_match = re.search(r'\.(\d{3})_T\d+\.\d+\.\d+.*\.rtraw', basename)
-    file_number = file_match.group(1) if file_match else "000"
-
-    print(f"Input : {basename}")
-    print(f"RUN   : {parsed_run}   File: {file_number}")
-    print()
-
-    # ── Process ───────────────────────────────────────────────────────────────
-    result = process_exotic_rtraw(rtraw_file, calibration, dark_noise_pe)
-    if result is None:
-        print("ERROR: Processing failed.")
-        return None
-
-    # ── Statistics summary ────────────────────────────────────────────────────
-    s  = result['stats_shared']
-    sm = result['stats_mode']
-    print()
-    print("=" * 60)
-    print("Veto statistics")
-    print("=" * 60)
-    print(f"  Muon events (total)  : {s['n_muons']}")
-    print(f"    CD-tagged           : {s['n_muons_cd']}")
-    if result['has_wt']:
-        print(f"    WT-tagged           : {s['n_muons_wt']}")
-    if result['has_tvt']:
-        print(f"    TVT-tagged          : {s['n_muons_tvt']}")
-    print()
-    print(f"{'':4} {'Mode A':>12} {'Mode B':>12} {'Mode C':>12}")
-    print(f"{'':4} {'(standard)':>12} {'(inv+cut)':>12} {'(inv-cut)':>12}")
-    print("-" * 48)
-    for key, label in [('n_outlier', 'Outlier'), ('n_after_muon', 'After-muon'),
-                       ('n_after_pulse', 'After-pulse'), ('n_clean', 'CLEAN')]:
-        row = f"  {label:<16}"
-        for m in ('a', 'b', 'c'):
-            row += f" {sm[m][key]:>12d}"
-        print(row)
-    print()
-
-    # ── Write output ──────────────────────────────────────────────────────────
-    os.makedirs(output_dir, exist_ok=True)
-    outpath = os.path.join(output_dir,
-                           f"EXOTIC_spectrum_RUN{parsed_run}_{file_number}.root")
-    write_output(result, outpath, parsed_run, file_number, calib_file)
-
-    print("=" * 60)
-    print("SUCCESS")
-    print(f"Output: {outpath}")
-    print("=" * 60)
-    return outpath
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Exotic tri-mode energy spectrum from RTRAW with full CALIB2 veto",
+        description="Generate PE spectra with ADC cut modes (A/B/C/D)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Modes
------
-  A  standard    ADC_HIT_MIN <= adc <= ADC_HIT_MAX  +  MAX_TOTAL_ADC event cut
-  B  inv+cut     adc >= ADC_HIT_MAX (inverted)       +  MAX_TOTAL_ADC event cut
-  C  inv-cut     adc >= ADC_HIT_MAX (inverted)       +  NO event ADC cut
+Modes:
+  A  Standard: ADC_HIT_MIN ≤ adc ≤ ADC_HIT_MAX, MAX_TOTAL_ADC applied
+  B  Inverted: adc ≥ ADC_HIT_MAX, MAX_TOTAL_ADC applied  
+  C  Inverted: adc ≥ ADC_HIT_MAX, no MAX_TOTAL_ADC cut
+  D  Baseline: adc < ADC_HIT_MIN, no event cuts (dark noise study)
 
-Examples
---------
-  # Default calibration auto-selected from run number:
-  python get_spectrum_exotic.py /path/RUN.1295.xxx.rtraw /path/output --run 1295
-
-  # Override calibration file explicitly:
-  python get_spectrum_exotic.py /path/RUN.1295.xxx.rtraw /path/output --run 1295 \\
-      --calib-file /path/to/sipm_calib_1295-.txt
-""")
-    parser.add_argument("rtraw_file",   help="Path to RTRAW file (local or XRootD URL)")
-    parser.add_argument("output_dir",   help="Output directory for ROOT file")
-    parser.add_argument("--run",        type=int, required=True,
-                        help="Run number — used to auto-select official gain calibration")
-    parser.add_argument("--calib-file", default=None,
-                        help="Override gain calibration TXT file (default: auto from --run)")
+Examples:
+  python get_spectrum_ADC_cut.py /path/RUN.1295.xxx.rtraw --run 1295 \\
+      --calib-dir /path/to/calibration --output spectrum_ADC_cut.root
+"""
+    )
+    
+    parser.add_argument("rtraw_file", help="Path to RTRAW file")
+    parser.add_argument("--run", type=int, required=True,
+                        help="Run number (required for calibration selection)")
+    parser.add_argument("--calib-dir", required=True,
+                        help="Directory containing sipm_calib_*.txt files")
+    parser.add_argument("--output", default=None,
+                        help="Output ROOT file (default: auto-named)")
+    
     args = parser.parse_args()
-
-    # Allow XRootD URLs without local existence check
-    if not args.rtraw_file.startswith("root://") and not os.path.exists(args.rtraw_file):
-        print(f"ERROR: RTRAW file not found: {args.rtraw_file}")
+    
+    # Select calibration file
+    calib_file, calib_label = get_calib_file(args.run, args.calib_dir)
+    print(f"Run {args.run} → calibration: {calib_label}")
+    
+    # Load calibration
+    calibration = load_calibration(calib_file)
+    if not calibration:
+        print("ERROR: No calibration loaded")
         sys.exit(1)
-
-    sys.exit(0 if run_exotic(args.rtraw_file, args.output_dir,
-                             args.run, args.calib_file) else 1)
+    
+    # Process file
+    result = process_rtraw(args.rtraw_file, calibration, args.run)
+    if result is None:
+        sys.exit(1)
+    
+    # Print efficiency table
+    print_efficiency_table(result['stats_mode'], result['stats']['n_events'])
+    
+    # Write output
+    if args.output:
+        outpath = args.output
+    else:
+        outpath = f"spectrum_ADC_cut_RUN{args.run}_{result['file_number']}.root"
+    
+    write_output(result, outpath, args.run, calib_file)

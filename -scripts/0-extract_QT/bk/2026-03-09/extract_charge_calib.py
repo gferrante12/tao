@@ -31,10 +31,6 @@ NOTE on duplicate-free design:
     the event-level loop — they operate on different objects and do not
     overlap: ADC_HIT_MAX filters individual hits, MAX_ADC_PER_CHANNEL
     flags the entire channel and skips it from event-level totals.
-
-NEW FEATURES (v2.0):
-  - --save-tdc-adc: Save per-channel TDC vs ADC 2D histograms for cut optimization
-  - --tdc-adc-channels: Number of channels to save 2D histograms for
 """
 
 import sys
@@ -147,18 +143,10 @@ PARAMS_MAP = {
 # MAIN EXTRACTION FUNCTION
 # =============================================================================
 
-def extract_charge_data(rtraw_file, output_dir, mode="calib2",
-                        save_tdc_adc=False, tdc_adc_channels=100):
+def extract_charge_data(rtraw_file, output_dir, mode="calib2"):
     """
     Extract per-channel ADC histograms (raw + clean) from one RTRAW file.
     No spatial/radial cut — not applicable to RTRAW without prior reconstruction.
-    
-    Args:
-        rtraw_file: Path to RTRAW file
-        output_dir: Output directory
-        mode: Analysis mode (calib, calib2, physics, ibd)
-        save_tdc_adc: If True, save per-channel TDC vs ADC 2D histograms
-        tdc_adc_channels: Number of channels for 2D histograms (0 to N-1)
     """
     if not file_exists_or_accessible(rtraw_file):
         print(f"ERROR: File not found: {rtraw_file}")
@@ -207,8 +195,6 @@ def extract_charge_data(rtraw_file, output_dir, mode="calib2",
     if USE_HIT_CUTS:
         print(f"  Per-hit TDC window     : [{TDC_HIT_MIN}, {TDC_HIT_MAX}] ns")
         print(f"  Per-hit ADC window     : [{ADC_HIT_MIN}, {ADC_HIT_MAX}]")
-    if save_tdc_adc:
-        print(f"  TDC-ADC 2D histograms  : channels 0-{tdc_adc_channels-1}")
     print()
 
     # Open RTRAW
@@ -279,20 +265,20 @@ def extract_charge_data(rtraw_file, output_dir, mode="calib2",
     hists_adc_oor_raw   = {}
     hists_adc_oor_clean = {}
 
-    # ── TDC vs ADC 2D histograms (NEW) ──────────────────────────────────────
-    TDC_NBINS_2D, TDC_MIN_2D, TDC_MAX_2D = 200, 0.0, 2000.0
-    ADC_NBINS_2D = 100   # coarser ADC axis for 2D to keep file size small
+    # TDC vs ADC 2D histograms (clean events, selected channels only)
+    TDC_NBINS, TDC_MIN, TDC_MAX = 200, 0.0, 2000.0
+    ADC_NBINS2D = 100   # coarser ADC axis for 2D to keep file size small
     tdc_adc_ch_ids = list(range(min(tdc_adc_channels, N_CHANNELS)))
     hists_tdc_adc = {}
     
     if save_tdc_adc:
-        print(f"Creating TDC-vs-ADC 2D histograms for {len(tdc_adc_ch_ids)} channels...")
+        print(f"Creating TDC-vs-ADC 2D histograms for {len(tdc_adc_ch_ids)} channels ...")
         for ch in tdc_adc_ch_ids:
             h2 = ROOT.TH2F(
                 f"H_tdcAdc_{ch}",
-                f"TDC vs ADC ch{ch};TDC [ns];ADC [counts]",
-                TDC_NBINS_2D, TDC_MIN_2D, TDC_MAX_2D,
-                ADC_NBINS_2D, XMIN, XMAX,
+                f"TDC vs ADC ch{ch};TDC sample [ns];ADC sample [counts]",
+                TDC_NBINS, TDC_MIN, TDC_MAX,
+                ADC_NBINS2D, XMIN, XMAX,
             )
             h2.SetDirectory(0)
             hists_tdc_adc[ch] = h2
@@ -321,19 +307,18 @@ def extract_charge_data(rtraw_file, output_dir, mode="calib2",
         tvt_elec_tree.SetBranchAddress("TvtElecEvt", tvt_elec_evt)
         tvt_trig_tree.SetBranchAddress("TvtTrigEvt", tvt_trig_evt)
 
-    # ── Statistics ──────────────────────────────────────────────────────────
-    n_muons = n_muons_cd = n_muons_wt = n_muons_tvt = 0
-    n_after_muon = n_after_pulse = n_outlier = n_clean = 0
-    total_hits = 0
+    # ── Event loop ───────────────────────────────────────────────────────────
+    print(f"Processing {nentries} events...")
     out_of_range_channels = Counter()
+    total_hits = 0
 
-    # Muon tracking
     sec_prev = nsec_prev = 0
-    sec_mu = nsec_mu = 0
+    sec_mu   = nsec_mu   = 0
     is_after_muon = False
 
-    # ── Event loop ──────────────────────────────────────────────────────────
-    print(f"Processing {nentries} events...")
+    n_muons = n_muons_cd = n_muons_wt = n_muons_tvt = 0
+    n_after_muon = n_after_pulse = n_outlier = n_clean = 0
+
     for i in range(nentries):
         if (i + 1) % 10000 == 0:
             print(f"\rEvent {i+1}/{nentries}...", end='', flush=True)
@@ -347,219 +332,183 @@ def extract_charge_data(rtraw_file, output_dir, mode="calib2",
             tvt_elec_tree.GetEntry(i)
             tvt_trig_tree.GetEntry(i)
 
-        # Event timing
         trig_time = cd_trig_evt.getTrigTime()
-        sec = trig_time.GetSec()
+        sec  = trig_time.GetSec()
         nsec = trig_time.GetNanoSec()
 
-        # After-muon window expiry
+        # After-muon veto bookkeeping
         if is_after_muon:
-            dt = (sec - sec_mu) * 1e9 + (nsec - nsec_mu)
-            if dt > AFTER_MU:
+            if (sec - sec_mu) * 1e9 + (nsec - nsec_mu) > AFTER_MU:
                 is_after_muon = False
 
-        # After-pulse flag
-        is_after_pulse = False
+        # After-pulse veto
         if i > 0:
-            dt = (sec - sec_prev) * 1e9 + (nsec - nsec_prev)
-            if dt < AFTER_PULSE:
-                is_after_pulse = True
+            diff = (sec - sec_prev) * 1e9 + (nsec - nsec_prev)
+            is_after_pulse = (diff < AFTER_PULSE)
+        else:
+            is_after_pulse = False
 
-        # ── Collect channel data ────────────────────────────────────────────
-        channels = cd_elec_evt.GetElecChannels()
+        # ── Per-channel loop: build event totals ─────────────────────────────
+        channels      = cd_elec_evt.GetElecChannels()
+        n_fired       = channels.size()
         tot_adc_event = 0.0
-        n_hit_channels = 0
         event_channel_data = []
-        has_flasher = False
+        has_flasher   = False
 
-        for j in range(channels.size()):
+        for j in range(n_fired):
             channel = channels[j]
-            chid = channel.ElecgetChannelID()
-            adc_vals = list(channel.ElecgetAdcs())
-            tdc_vals = list(channel.ElecgetTdcs())
+            chid    = channel.getChannelID()
+            adcs    = channel.getADCs()
+            tdcs    = channel.getTDCs()
 
-            ch_adc_sum = 0.0
-            for adc_val in adc_vals:
-                ch_adc_sum += adc_val
-                total_hits += 1
+            # Sum all ADC hits for this channel (event-level flasher check)
+            adcs_list     = [adcs[k] for k in range(adcs.size())]
+            ch_total_adc  = sum(adcs_list)
 
-            # Check for flasher (per-channel saturation)
-            if ch_adc_sum > MAX_ADC_PER_CHANNEL:
+            # Event-level per-channel flasher guard
+            if ch_total_adc > MAX_ADC_PER_CHANNEL:
                 has_flasher = True
+                continue
+            if not adcs_list:
+                continue
 
-            tot_adc_event += ch_adc_sum
-            n_hit_channels += 1
+            tot_adc_event += ch_total_adc
+            total_hits    += len(adcs_list)
+
+            n_hits = min(adcs.size(), tdcs.size())
+            hits   = [(float(adcs[k]), float(tdcs[k])) for k in range(n_hits)]
+            for k in range(n_hits, adcs.size()):
+                hits.append((float(adcs[k]), -1.0))
 
             event_channel_data.append({
-                'chid': chid,
-                'adcs_list': adc_vals,
-                'tdc_list': tdc_vals,
+                'chid':         chid,
+                'hits':         hits,
+                'ch_total_adc': ch_total_adc,
             })
 
-        # ── Muon tagging ────────────────────────────────────────────────────
-        is_muon = False
-        is_muon_cd = tot_adc_event > MUON_THRESHOLD_CD
-        is_muon_wt = False
+        n_hit_channels = len(event_channel_data)
+
+        # ── Muon tagging ─────────────────────────────────────────────────────
+        is_muon_cd  = (tot_adc_event > MUON_THRESHOLD_CD)
+        is_muon_wt  = False
         is_muon_tvt = False
-
         if has_wt:
-            wt_channels = wt_elec_evt.GetElecChannels()
-            if wt_channels.size() >= MUON_THRESHOLD_WT:
-                is_muon_wt = True
-
+            is_muon_wt  = (wt_elec_evt.GetElecChannels().size() >= MUON_THRESHOLD_WT)
         if has_tvt:
-            tvt_channels = tvt_elec_evt.GetElecChannels()
-            if tvt_channels.size() >= MUON_THRESHOLD_TVT:
-                is_muon_tvt = True
-
+            is_muon_tvt = (tvt_elec_evt.GetElecChannels().size() >= MUON_THRESHOLD_TVT)
         is_muon = is_muon_cd or is_muon_wt or is_muon_tvt
 
-        # ── Determine veto flag ─────────────────────────────────────────────
-        veto_flag = 0  # 0 = clean
+        # ── Outlier checks ───────────────────────────────────────────────────
+        passes_outlier = (tot_adc_event <= MAX_TOTAL_ADC
+                          and MIN_NHIT <= n_hit_channels <= MAX_NHIT
+                          and not has_flasher)
 
-        if has_flasher or tot_adc_event > MAX_TOTAL_ADC:
-            veto_flag = 1  # outlier
+        # ── Assign veto flag (priority order) ────────────────────────────────
+        if not passes_outlier:
+            veto_flag = 4   # outlier
             n_outlier += 1
-        elif n_hit_channels < MIN_NHIT or n_hit_channels > MAX_NHIT:
-            veto_flag = 1  # outlier
-            n_outlier += 1
-        elif is_muon:
-            veto_flag = 2  # muon (triggers veto window, not counted as outlier)
         elif is_after_muon:
-            veto_flag = 3  # after-muon
+            veto_flag = 2   # after-muon
             n_after_muon += 1
         elif is_after_pulse:
-            veto_flag = 4  # after-pulse
+            veto_flag = 1   # after-pulse
             n_after_pulse += 1
         else:
+            veto_flag = 0   # clean
             n_clean += 1
 
-        # ── Fill TIER 1 (Raw) histograms - all non-flasher events ───────────
+        # ── Fill TIER 1 (Raw) — all non-flasher events ───────────────────────
         for ch_data in event_channel_data:
             chid = ch_data['chid']
-            adcs_list = ch_data['adcs_list']
-            is_oor = (chid < 0 or chid >= N_CHANNELS)
+            hits = ch_data['hits']
+            is_oor = not (0 <= chid < N_CHANNELS)
 
             if is_oor:
                 if chid not in hists_adc_oor_raw:
-                    h_raw = ROOT.TH1F(f"H_adcraw_{chid}", f"ADC raw {chid} (OOR)",
-                                      NBINS, XMIN, XMAX)
-                    h_raw.SetDirectory(0)
-                    hists_adc_oor_raw[chid] = h_raw
-                    out_of_range_channels[chid] += 1
-
-                for adc_val in adcs_list:
-                    hists_adc_oor_raw[chid].Fill(adc_val)
+                    h = ROOT.TH1F(f"H_adcraw_{chid}", f"ADC raw {chid} (OOR)",
+                                  NBINS, XMIN, XMAX)
+                    h.SetDirectory(0)
+                    hists_adc_oor_raw[chid] = h
+                out_of_range_channels[chid] += 1
+                target = hists_adc_oor_raw[chid]
             else:
-                for adc_val in adcs_list:
-                    hists_adc_raw[chid].Fill(adc_val)
+                target = hists_adc_raw[chid]
 
-        # ── Fill TIER 2 (Clean) histograms - only clean events ──────────────
+            for adc_val, tdc_val in hits:
+                # Per-hit ADC upper cut (muon rejection) — applied in all modes
+                if ADC_HIT_MAX is not None and adc_val > ADC_HIT_MAX:
+                    continue
+                if USE_HIT_CUTS:
+                    if ADC_HIT_MIN is not None and adc_val < ADC_HIT_MIN:
+                        continue
+                    if TDC_HIT_MIN is not None and not (TDC_HIT_MIN <= tdc_val <= TDC_HIT_MAX):
+                        continue
+                target.Fill(adc_val)
+
+        # ── Fill TIER 2 (Clean) ───────────────────────────────────────────────
         if veto_flag == 0:
             for ch_data in event_channel_data:
                 chid = ch_data['chid']
-                adcs_list = ch_data['adcs_list']
-                tdc_list = ch_data['tdc_list']
-                is_oor = (chid < 0 or chid >= N_CHANNELS)
+                hits = ch_data['hits']
+                is_oor = not (0 <= chid < N_CHANNELS)
 
                 if is_oor:
                     if chid not in hists_adc_oor_clean:
-                        h_clean = ROOT.TH1F(f"H_adcClean_{chid}", f"ADC Clean {chid} (OOR)",
-                                            NBINS, XMIN, XMAX)
-                        h_clean.SetDirectory(0)
-                        hists_adc_oor_clean[chid] = h_clean
-
-                    for adc_val in adcs_list:
-                        # Apply per-hit cuts if enabled
-                        if ADC_HIT_MAX is not None and adc_val > ADC_HIT_MAX:
-                            continue
-                        if ADC_HIT_MIN is not None and adc_val < ADC_HIT_MIN:
-                            continue
-                        hists_adc_oor_clean[chid].Fill(adc_val)
+                        h = ROOT.TH1F(f"H_adcClean_{chid}", f"ADC Clean {chid} (OOR)",
+                                      NBINS, XMIN, XMAX)
+                        h.SetDirectory(0)
+                        hists_adc_oor_clean[chid] = h
+                    target = hists_adc_oor_clean[chid]
                 else:
-                    for k, adc_val in enumerate(adcs_list):
-                        tdc_val = tdc_list[k] if k < len(tdc_list) else 0.0
+                    target = hists_adc_clean[chid]
 
-                        # Apply per-hit cuts if enabled
-                        if ADC_HIT_MAX is not None and adc_val > ADC_HIT_MAX:
-                            continue
+                for adc_val, tdc_val in hits:
+                    if ADC_HIT_MAX is not None and adc_val > ADC_HIT_MAX:
+                        continue
+                    if USE_HIT_CUTS:
                         if ADC_HIT_MIN is not None and adc_val < ADC_HIT_MIN:
                             continue
-                        if TDC_HIT_MIN is not None and tdc_val < TDC_HIT_MIN:
+                        if TDC_HIT_MIN is not None and not (TDC_HIT_MIN <= tdc_val <= TDC_HIT_MAX):
                             continue
-                        if TDC_HIT_MAX is not None and tdc_val > TDC_HIT_MAX:
-                            continue
+                    target.Fill(adc_val)
 
-                        hists_adc_clean[chid].Fill(adc_val)
-
-                        # ── Fill TDC-ADC 2D histograms (NEW) ────────────────
-                        if save_tdc_adc and chid in hists_tdc_adc:
-                            hists_tdc_adc[chid].Fill(float(tdc_val), float(adc_val))
-
-        # ── Update muon tracking ────────────────────────────────────────────
+        # ── Muon bookkeeping ─────────────────────────────────────────────────
         if is_muon:
             is_after_muon = True
-            sec_mu = sec
-            nsec_mu = nsec
+            sec_mu = sec; nsec_mu = nsec
             n_muons += 1
-            if is_muon_cd:
-                n_muons_cd += 1
-            if is_muon_wt:
-                n_muons_wt += 1
-            if is_muon_tvt:
-                n_muons_tvt += 1
+            n_muons_cd  += int(is_muon_cd)
+            n_muons_wt  += int(is_muon_wt)
+            n_muons_tvt += int(is_muon_tvt)
 
-        sec_prev = sec
-        nsec_prev = nsec
+        sec_prev = sec; nsec_prev = nsec
 
     print(f"\rEvent {nentries}/{nentries}... Done!")
 
-    # ── Statistics ──────────────────────────────────────────────────────────
+    # ── Statistics ───────────────────────────────────────────────────────────
     print()
-    print(f"Statistics:")
-    print(f"  Total hits: {total_hits:,}")
-    print(f"  Out-of-range channels: {len(out_of_range_channels)}")
     print("Veto Statistics:")
-    print(f"  Muon events (total): {n_muons:,}")
-    print(f"    - Tagged by CD: {n_muons_cd:,}")
-    if has_wt:
-        print(f"    - Tagged by WT: {n_muons_wt:,}")
-    if has_tvt:
-        print(f"    - Tagged by TVT: {n_muons_tvt:,}")
-    print(f"  Events vetoed (after muon): {n_after_muon:,}")
-    print(f"  Events vetoed (after pulse): {n_after_pulse:,}")
-    print(f"  Events vetoed (outliers): {n_outlier:,}")
-    print(f"  Clean events: {n_clean:,}")
-    print(f"  Clean fraction: {100*n_clean/nentries:.1f}%")
+    print(f"  Muon events (total)       : {n_muons}")
+    print(f"    Tagged by CD            : {n_muons_cd}")
+    if has_wt:  print(f"    Tagged by WT            : {n_muons_wt}")
+    if has_tvt: print(f"    Tagged by TVT           : {n_muons_tvt}")
+    print(f"  Vetoed (after-muon)       : {n_after_muon}")
+    print(f"  Vetoed (after-pulse)      : {n_after_pulse}")
+    print(f"  Vetoed (outlier/flasher)  : {n_outlier}")
+    print(f"  Clean events              : {n_clean}")
+    print(f"  Clean fraction            : {100*n_clean/max(nentries,1):.1f}%")
+    print(f"  Out-of-range channels     : {len(out_of_range_channels)}")
     print()
 
-    # ── Save output ─────────────────────────────────────────────────────────
+    # ── Save ─────────────────────────────────────────────────────────────────
     print(f"Saving to {output_file}")
     fout.cd()
+    for h in hists_adc_raw:   h.Write()
+    for h in hists_adc_oor_raw.values():   h.Write()
+    for h in hists_adc_clean: h.Write()
+    for h in hists_adc_oor_clean.values(): h.Write()
 
-    # Write TIER 1 (Raw) histograms
-    for h in hists_adc_raw:
-        h.Write()
-    for h in hists_adc_oor_raw.values():
-        h.Write()
-
-    # Write TIER 2 (Clean) histograms
-    for h in hists_adc_clean:
-        h.Write()
-    for h in hists_adc_oor_clean.values():
-        h.Write()
-
-    # ── Write TDC-ADC 2D histograms (NEW) ───────────────────────────────────
-    if save_tdc_adc and hists_tdc_adc:
-        tdc_dir = fout.mkdir("TdcAdc")
-        tdc_dir.cd()
-        for h2 in hists_tdc_adc.values():
-            h2.Write()
-        fout.cd()
-        print(f"  TDC-ADC 2D histograms: {len(hists_tdc_adc)} channels → TdcAdc/")
-
-    # ── Save metadata ───────────────────────────────────────────────────────
-    veto_info_str = (
+    meta = (
         f"MODE={mode};"
         f"MUON_THRESHOLD_CD={MUON_THRESHOLD_CD};"
         f"MUON_THRESHOLD_WT={MUON_THRESHOLD_WT};"
@@ -568,31 +517,25 @@ def extract_charge_data(rtraw_file, output_dir, mode="calib2",
         f"AFTER_PULSE={AFTER_PULSE};"
         f"MAX_TOTAL_ADC={MAX_TOTAL_ADC};"
         f"MAX_ADC_PER_CHANNEL={MAX_ADC_PER_CHANNEL};"
+        f"ADC_HIT_MAX={ADC_HIT_MAX};"
         f"MIN_NHIT={MIN_NHIT};"
         f"MAX_NHIT={MAX_NHIT};"
         f"TDC_HIT_MIN={TDC_HIT_MIN};"
         f"TDC_HIT_MAX={TDC_HIT_MAX};"
         f"ADC_HIT_MIN={ADC_HIT_MIN};"
-        f"ADC_HIT_MAX={ADC_HIT_MAX};"
-        f"N_EVENTS={nentries};"
         f"N_MUONS={n_muons};"
-        f"N_MUONS_CD={n_muons_cd};"
-        f"N_MUONS_WT={n_muons_wt};"
-        f"N_MUONS_TVT={n_muons_tvt};"
         f"N_AFTER_MUON={n_after_muon};"
         f"N_AFTER_PULSE={n_after_pulse};"
         f"N_OUTLIER={n_outlier};"
         f"N_CLEAN={n_clean};"
-        f"HAS_WT={1 if has_wt else 0};"
-        f"HAS_TVT={1 if has_tvt else 0};"
-        f"SAVE_TDC_ADC={1 if save_tdc_adc else 0};"
-        f"TDC_ADC_CHANNELS={tdc_adc_channels if save_tdc_adc else 0}"
+        f"HAS_WT={int(has_wt)};"
+        f"HAS_TVT={int(has_tvt)};"
+        f"SPATIAL_CUT_ENABLED=0"
     )
-    ROOT.TNamed("veto_info", veto_info_str).Write()
+    ROOT.TNamed("veto_info", meta).Write()
 
     fout.Close()
     frtraw.Close()
-
     print()
     print("=" * 60)
     print("SUCCESS")
@@ -610,32 +553,18 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Standard extraction
   python extract_charge_calib.py /path/RUN.1295.xxx.rtraw /path/output --mode calib2
-
-  # With TDC-ADC 2D histograms for cut optimization
-  python extract_charge_calib.py /path/RUN.1295.xxx.rtraw /path/output --mode calib2 \\
-      --save-tdc-adc --tdc-adc-channels 100
-
-  # Physics mode
-  python extract_charge_calib.py /path/RUN.1410.xxx.rtraw /path/output --mode physics
+  python extract_charge_calib.py /path/RUN.1410.xxx.rtraw /path/output --mode calib
 """)
-    parser.add_argument("rtraw_file", help="Path to RTRAW file")
-    parser.add_argument("output_dir", help="Output directory")
+    parser.add_argument("rtraw_file",  help="Path to RTRAW file")
+    parser.add_argument("output_dir",  help="Output directory")
+    parser.add_argument('--save-tdc-adc', action='store_true',
+                       help='Save per-channel TDC vs ADC 2D histograms (clean events) '
+                            'under TdcAdc/ directory in the output ROOT file.')
+    parser.add_argument('--tdc-adc-channels', type=int, default=100,
+                       help='Number of channels for TDC-ADC 2D histograms (default: 100)')
     parser.add_argument("--mode",
         choices=list(PARAMS_MAP), default="calib2",
         help="Analysis mode (default: calib2 — adds per-hit TDC window)")
-    # NEW ARGUMENTS:
-    parser.add_argument('--save-tdc-adc', action='store_true',
-                       help='Save per-channel TDC vs ADC 2D histograms (clean events) '
-                            'under TdcAdc/ directory in the output ROOT file. '
-                            'Useful for cut optimization and QT diagnostics.')
-    parser.add_argument('--tdc-adc-channels', type=int, default=100,
-                       help='Number of channels for TDC-ADC 2D histograms (default: 100). '
-                            'Channels 0 to N-1 will have 2D histograms saved.')
-
     args = parser.parse_args()
-    
-    extract_charge_data(args.rtraw_file, args.output_dir, mode=args.mode,
-                       save_tdc_adc=args.save_tdc_adc,
-                       tdc_adc_channels=args.tdc_adc_channels)
+    extract_charge_data(args.rtraw_file, args.output_dir, mode=args.mode)
