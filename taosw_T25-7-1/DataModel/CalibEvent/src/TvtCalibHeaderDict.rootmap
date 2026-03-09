@@ -1,0 +1,7 @@
+{ decls }
+namespace Tao {  }
+
+[ libCalibEvent.so ]
+# List of selected classes
+class Tao::TvtCalibHeader
+header Event/TvtCalibHeader.h
