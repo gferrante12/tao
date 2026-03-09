@@ -1,0 +1,2 @@
+add_subdirectory(TAOGeometry)
+add_subdirectory(TAOIDService)
