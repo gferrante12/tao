@@ -1,0 +1,4 @@
+add_subdirectory(SiPMCalibAlg)
+add_subdirectory(CalibSvc)
+add_subdirectory(CalibAlg)
+add_subdirectory(CalibAna)
