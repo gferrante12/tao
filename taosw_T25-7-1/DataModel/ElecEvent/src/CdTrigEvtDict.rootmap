@@ -1,0 +1,7 @@
+{ decls }
+namespace Tao {  }
+
+[ libElecEvent.so ]
+# List of selected classes
+class Tao::CdTrigEvt
+header Event/CdTrigEvt.h

@@ -1,0 +1,9 @@
+{ decls }
+namespace std {  }
+namespace Tao {  }
+
+[ libElecEvent.so ]
+# List of selected classes
+class Tao::TvtElecChannel
+class vector<Tao::TvtElecChannel>
+header Event/TvtElecChannel.h
