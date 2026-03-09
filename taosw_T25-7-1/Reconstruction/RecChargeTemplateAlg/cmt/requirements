@@ -1,0 +1,19 @@
+package ChargeTemplatePos
+
+use SniperRelease   *
+use DetSimPolicy    *  Simulation/DetSimV2
+use DetSimAlg       *  Simulation/DetSim
+use GenEventV2		*  DataModel
+
+use Geometry        *  Detector
+
+use EvtNavigator v* DataModel
+use SimEvent     v* DataModel
+use BufferMemMgr v* CommonSvc
+use RootIOSvc    v* RootIO
+
+macro_append ChargeTemplatePos_cppflags "-Wno-return-type -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-parameter -Wno-nonnull-compare -Wno-reorder -Wno-overloaded-virtual"
+
+library ChargeTemplatePos *.cc
+apply_pattern linker_library library=ChargeTemplatePos
+apply_pattern install_more_includes more=ChargeTemplatePos
