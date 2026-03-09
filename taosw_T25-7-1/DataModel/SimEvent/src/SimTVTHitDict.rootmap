@@ -1,0 +1,9 @@
+{ decls }
+namespace std {  }
+namespace Tao {  }
+
+[ libSimEvent.so ]
+# List of selected classes
+class Tao::SimTVTHit
+class vector<Tao::SimTVTHit>
+header Event/SimTVTHit.h
