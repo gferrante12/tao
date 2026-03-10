@@ -374,9 +374,9 @@ def extract_charge_data(rtraw_file, output_dir, mode="calib2",
 
         for j in range(channels.size()):
             channel = channels[j]
-            chid = channel.ElecgetChannelID()
-            adc_vals = list(channel.ElecgetAdcs())
-            tdc_vals = list(channel.ElecgetTdcs())
+            chid = channel.getChannelID()
+            adc_vals = list(channel.getADCs())
+            tdc_vals = list(channel.getTDCs())
 
             ch_adc_sum = 0.0
             for adc_val in adc_vals:
