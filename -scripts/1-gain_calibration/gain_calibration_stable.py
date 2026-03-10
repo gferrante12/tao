@@ -10,9 +10,15 @@ Three classification methods:
   B) Relaxed:   bad fits reclassified as good if R2 >= 0.98 AND gain in range
   C) R2-only:   good if R2 >= 0.98 (ignore chi2 and gain range)
 
+Three classification labels (all methods):
+  good        — passes all quality criteria AND n_peaks >= 3
+  bad         — fit succeeded but quality criteria not met OR n_peaks < 3
+  failed      — fit did not converge / insufficient data
+
 Outputs per method:
   - RUNXXXX_fit_quality_piechart_METHOD.png
-  - RUNXXXX_summary_plots_METHOD.png
+  - RUNXXXX_summary_plots_METHOD.png          (2 rows: good / bad)
+  - RUNXXXX_{METHOD}_{good|bad|failed}.csv/.txt
   - RUNXXXX_classification_comparison.txt
 
 Usage:
@@ -59,12 +65,12 @@ N_BINS     = len(BIN_CENTERS)
 
 # Fit quality thresholds
 CHI2_MAX           = 160.0
-LINEAR_R2_MIN      = 0.90
-R2_RELAXED_MIN     = 0.98     # Method B & C threshold
+LINEAR_R2_MIN      = 0.99
+R2_RELAXED_MIN     = 0.99     # Method B & C threshold
 
 # Peak detection
 MAX_PEAKS          = 8
-MAX_ADC_SEARCH     = 48000
+MAX_ADC_SEARCH     = 50000
 PEAK_WIDTH         = 1200.0
 MAX_SIGMA          = 3000.0
 
@@ -73,8 +79,8 @@ FIRST_PEAK_MIN     = 1500
 FIRST_PEAK_MAX     = 9000
 
 # Expected gain
-EXPECTED_GAIN_MIN     = 3200
-EXPECTED_GAIN_MAX     = 8500
+EXPECTED_GAIN_MIN     = 3000
+EXPECTED_GAIN_MAX     = 9000
 EXPECTED_GAIN_DEFAULT = 6000
 
 USE_FIRST_PEAK = True
@@ -309,18 +315,24 @@ def process_channel_root(ch_id, hist_data):
 # CLASSIFICATION METHODS
 # =============================================================================
 def classify_A(r):
-    """Method A: chi2/ndf + R2 + gain range (standard)."""
+    """Method A: chi2/ndf + R2 + gain range (standard).
+    Requires n_peaks >= 3 for 'good'; n_peaks < 3 → 'bad'."""
     if r['fit_status'] != 1:
         return 'failed'
+    if r['n_peaks'] < 3:
+        return 'bad'
     if (r['chi2_dof'] <= CHI2_MAX and r['linear_r2'] >= LINEAR_R2_MIN
             and EXPECTED_GAIN_MIN <= r['gain'] <= EXPECTED_GAIN_MAX):
         return 'good'
     return 'bad'
 
 def classify_B(r):
-    """Method B: same as A, but bad fits reclassified as good if R2 >= 0.98 AND gain in range."""
+    """Method B: same as A, but bad fits reclassified as good if R2 >= 0.98 AND gain in range.
+    Requires n_peaks >= 3 for 'good'; n_peaks < 3 → 'bad'."""
     if r['fit_status'] != 1:
         return 'failed'
+    if r['n_peaks'] < 3:
+        return 'bad'
     # First check standard
     if (r['chi2_dof'] <= CHI2_MAX and r['linear_r2'] >= LINEAR_R2_MIN
             and EXPECTED_GAIN_MIN <= r['gain'] <= EXPECTED_GAIN_MAX):
@@ -331,9 +343,12 @@ def classify_B(r):
     return 'bad'
 
 def classify_C(r):
-    """Method C: R2-only (good if R2 >= 0.98, ignore chi2 and gain range)."""
+    """Method C: R2-only (good if R2 >= 0.98, ignore chi2 and gain range).
+    Requires n_peaks >= 3 for 'good'; n_peaks < 3 → 'bad'."""
     if r['fit_status'] != 1:
         return 'failed'
+    if r['n_peaks'] < 3:
+        return 'bad'
     if r['linear_r2'] >= R2_RELAXED_MIN:
         return 'good'
     return 'bad'
@@ -345,9 +360,9 @@ CLASSIFIERS = {
 }
 
 METHOD_LABELS = {
-    'A_standard':    'Method A: χ²/ndf + R² + gain range',
-    'B_relaxed_r2':  'Method B: A + reclassify if R²≥0.98 & gain OK',
-    'C_r2_only':     'Method C: R²≥0.98 only',
+    'A_standard':    'Method A: χ²/ndf + R² + gain range  [good≥3pk / bad / failed]',
+    'B_relaxed_r2':  'Method B: A + reclassify if R²≥0.98 & gain OK  [good≥3pk / bad / failed]',
+    'C_r2_only':     'Method C: R²≥0.98 only  [good≥3pk / bad / failed]',
 }
 
 def split_results(results, classifier_fn):
@@ -385,16 +400,48 @@ def plot_piechart(good, bad, failed, method_key, run_name, out_dir):
     pct = lambda n: 100.0 * n / n_tot
 
     fig, ax = plt.subplots(figsize=(10, 8))
-    sizes = [n_g, n_b, n_f]
-    labels = [f'Good\n{n_g} ({pct(n_g):.1f}%)',
-              f'Bad\n{n_b} ({pct(n_b):.1f}%)',
-              f'Failed\n{n_f} ({pct(n_f):.1f}%)']
-    colors = ['#90EE90', '#FFA07A', '#FFB6C6']
-    ax.pie(sizes, explode=(0.05,0.05,0.05), labels=labels, colors=colors,
-           startangle=90, textprops=dict(fontsize=13, fontweight='bold'))
+    sizes  = [n_g,  n_b,  n_f]
+    labels = [
+        f'Good (≥3 peaks)\n{n_g} ({pct(n_g):.1f}%)',
+        f'Bad\n{n_b} ({pct(n_b):.1f}%)',
+        f'Failed\n{n_f} ({pct(n_f):.1f}%)',
+    ]
+    colors  = ['#90EE90', '#FFA07A', '#FFB6C6']
+    # Explode small slices more to separate overlapping labels
+    explode = [0.05 if s / n_tot > 0.10 else 0.15 for s in sizes]
+
+    # Hide slices with 0 count to keep the chart clean
+    nonzero = [(s, l, c, e) for s, l, c, e in zip(sizes, labels, colors, explode) if s > 0]
+    if nonzero:
+        sizes_, labels_, colors_, explode_ = zip(*nonzero)
+    else:
+        sizes_, labels_, colors_, explode_ = sizes, labels, colors, explode
+
+    wedges, texts = ax.pie(sizes_, explode=explode_, labels=labels_, colors=colors_,
+                           startangle=90, labeldistance=1.15,
+                           textprops=dict(fontsize=11, fontweight='bold'))
+
+    # Nudge labels apart when two adjacent slices are both small
+    # Collect (angle, text) pairs and push apart if too close
+    for i in range(len(texts)):
+        for j in range(i + 1, len(texts)):
+            pos_i = texts[i].get_position()
+            pos_j = texts[j].get_position()
+            dy = abs(pos_i[1] - pos_j[1])
+            dx = abs(pos_i[0] - pos_j[0])
+            if dy < 0.25 and dx < 0.6:
+                # Push them apart vertically
+                shift = (0.25 - dy) / 2 + 0.05
+                if pos_i[1] >= pos_j[1]:
+                    texts[i].set_position((pos_i[0], pos_i[1] + shift))
+                    texts[j].set_position((pos_j[0], pos_j[1] - shift))
+                else:
+                    texts[i].set_position((pos_i[0], pos_i[1] - shift))
+                    texts[j].set_position((pos_j[0], pos_j[1] + shift))
+
     ax.axis('equal')
     plt.title(f'{run_name} — {METHOD_LABELS[method_key]}\nTotal: {n_tot}',
-              fontsize=14, fontweight='bold', pad=20)
+              fontsize=13, fontweight='bold', pad=20)
     plt.tight_layout()
     path = os.path.join(out_dir, f'{run_name}_fit_quality_piechart_{method_key}.png')
     fig.savefig(path, dpi=150, bbox_inches='tight')
@@ -404,9 +451,30 @@ def plot_piechart(good, bad, failed, method_key, run_name, out_dir):
 # =============================================================================
 # PLOTTING: Summary plots per method (2×4 grid: good row, bad row)
 # =============================================================================
+def _overflow_label(ax, vals, rng_lo, rng_hi):
+    """Annotate overflow/underflow counts on a histogram axis."""
+    arr = np.array(vals)
+    n_under = int(np.sum(arr < rng_lo))
+    n_over  = int(np.sum(arr > rng_hi))
+    parts = []
+    if n_under > 0:
+        parts.append(f"UF: {n_under}")
+    if n_over > 0:
+        parts.append(f"OF: {n_over}")
+    if parts:
+        ax.text(0.98, 0.97, '\n'.join(parts),
+                transform=ax.transAxes, va='top', ha='right', fontsize=7,
+                family='monospace', color='crimson',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                          edgecolor='crimson', alpha=0.85))
+
+
 def _plot_dist_row(axes, fits, row, category, gain_min, gain_max):
     """Plot one row (4 columns: gain, chi2, R2, linear chi2) for a category."""
-    color_main = 'green' if category == 'Good' else 'red'
+    if 'Bad' in category:
+        color_main = 'red'
+    else:
+        color_main = 'green'
 
     # Col 0: Gain
     ax = axes[row, 0]
@@ -420,6 +488,7 @@ def _plot_dist_row(axes, fits, row, category, gain_min, gain_max):
         ax.text(0.65, 0.97, f'N={len(vals)}\nμ={mu:.1f}\nσ={std:.1f}',
                 transform=ax.transAxes, va='top', fontsize=8, family='monospace',
                 bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+        _overflow_label(ax, vals, rng[0], rng[1])
     ax.set_title(f'{category}: Gain', fontweight='bold', fontsize=10)
     ax.set_xlabel('Gain (ADC/PE)')
     ax.grid(True, alpha=0.3)
@@ -432,6 +501,7 @@ def _plot_dist_row(axes, fits, row, category, gain_min, gain_max):
         rng = (0, min(CHI2_MAX * 1.5, mu_c + 3*std_c))
         ax.hist(vals, bins=50, range=rng, color='blue', alpha=0.7, edgecolor='k')
         ax.set_yscale('log')
+        _overflow_label(ax, vals, rng[0], rng[1])
     ax.set_title(f'{category}: χ²/ndf', fontweight='bold', fontsize=10)
     ax.set_xlabel('χ²/ndf')
     ax.grid(True, alpha=0.3)
@@ -441,8 +511,10 @@ def _plot_dist_row(axes, fits, row, category, gain_min, gain_max):
     vals = [r['linear_r2'] for r in fits if r['linear_r2'] > 0]
     if vals:
         lo = max(0.85, np.min(vals) - 0.02)
-        ax.hist(vals, bins=50, range=(lo, 1.0), color='purple', alpha=0.7, edgecolor='k')
+        rng = (lo, 1.0)
+        ax.hist(vals, bins=50, range=rng, color='purple', alpha=0.7, edgecolor='k')
         ax.set_yscale('log')
+        _overflow_label(ax, vals, rng[0], rng[1])
     ax.set_title(f'{category}: R²', fontweight='bold', fontsize=10)
     ax.set_xlabel('R²')
     ax.grid(True, alpha=0.3)
@@ -452,8 +524,10 @@ def _plot_dist_row(axes, fits, row, category, gain_min, gain_max):
     vals = [r['linear_chi2_dof'] for r in fits if r['linear_chi2_dof'] > 0]
     if vals:
         mu_l, std_l = np.mean(vals), np.std(vals)
-        ax.hist(vals, bins=50, range=(0, mu_l + 3*std_l), color='orange', alpha=0.7, edgecolor='k')
+        rng = (0, mu_l + 3*std_l)
+        ax.hist(vals, bins=50, range=rng, color='orange', alpha=0.7, edgecolor='k')
         ax.set_yscale('log')
+        _overflow_label(ax, vals, rng[0], rng[1])
     ax.set_title(f'{category}: Linear χ²/ndf', fontweight='bold', fontsize=10)
     ax.set_xlabel('χ²/ndf')
     ax.grid(True, alpha=0.3)
@@ -461,10 +535,10 @@ def _plot_dist_row(axes, fits, row, category, gain_min, gain_max):
 
 def plot_summary(good, bad, method_key, run_name, out_dir):
     fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-    _plot_dist_row(axes, good, 0, 'Good', EXPECTED_GAIN_MIN, EXPECTED_GAIN_MAX)
-    _plot_dist_row(axes, bad,  1, 'Bad',  EXPECTED_GAIN_MIN, EXPECTED_GAIN_MAX)
-    plt.suptitle(f'{run_name} — {METHOD_LABELS[method_key]}', fontsize=16, fontweight='bold')
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    _plot_dist_row(axes, good, 0, 'Good (≥3 peaks)', EXPECTED_GAIN_MIN, EXPECTED_GAIN_MAX)
+    _plot_dist_row(axes, bad,  1, 'Bad',              EXPECTED_GAIN_MIN, EXPECTED_GAIN_MAX)
+    plt.suptitle(f'{run_name} — {METHOD_LABELS[method_key]}', fontsize=14, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
     path = os.path.join(out_dir, f'{run_name}_summary_plots_{method_key}.png')
     fig.savefig(path, dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -475,14 +549,50 @@ def plot_summary(good, bad, method_key, run_name, out_dir):
 # =============================================================================
 def plot_channel_fit(result, plot_dir, quality_label):
     ch_id = result['channel_id']
-    hist = result['hist']
+    hist  = result['hist']
 
+    color_map = {
+        'good':   'green',
+        'bad':    'orange',
+        'failed': 'red',
+    }
+    q_sub         = quality_label.replace('root_multigauss_', '')
+    color         = color_map.get(q_sub, 'gray')
+    quality_upper = q_sub.upper()
+
+    # ── FAILED: single panel (no linear-fit panel) ────────────────────────────
+    if q_sub == 'failed':
+        fig, ax1 = plt.subplots(1, 1, figsize=(10, 6))
+        fig.suptitle(f"Channel {ch_id} (ROOT Multi-Gauss) — {quality_upper}",
+                     fontsize=14, color=color, fontweight='bold')
+
+        ax1.step(BIN_CENTERS, hist, where='mid', color='black',
+                 linewidth=0.8, label='Data')
+        ax1.set_xlabel('ADC', fontsize=12)
+        ax1.set_ylabel('Counts', fontsize=12)
+        ax1.set_yscale('log')
+        y_max = hist.max()
+        if y_max > 0:
+            ax1.set_ylim(0.5, y_max * 5)
+        ax1.set_xlim(0, BIN_MAX)
+        ax1.legend(fontsize=9, loc='upper right')
+        ax1.grid(True, alpha=0.3)
+
+        info = f"STATUS: FAILED\nEvents: {int(np.sum(hist))}"
+        ax1.text(0.02, 0.98, info, transform=ax1.transAxes, va='top', fontsize=9,
+                 family='monospace',
+                 bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+
+        plt.tight_layout()
+        q_dir = os.path.join(plot_dir, q_sub)
+        os.makedirs(q_dir, exist_ok=True)
+        fig.savefig(os.path.join(q_dir, f"ch{ch_id:04d}_{quality_label}.png"),
+                    dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        return
+
+    # ── GOOD / BAD: two panels (ADC histogram + linear fit) ──────────────────
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    color_map = {'good': 'green', 'bad': 'orange', 'failed': 'red'}
-    color = color_map.get(quality_label.split('_')[-1], 'gray')
-    quality_upper = quality_label.split('_')[-1].upper()
-
     fig.suptitle(f"Channel {ch_id} (ROOT Multi-Gauss) — {quality_upper}",
                  fontsize=12, color=color, fontweight='bold')
 
@@ -525,10 +635,11 @@ def plot_channel_fit(result, plot_dir, quality_label):
     if result['fit_status'] == 1:
         info = (f"STATUS: SUCCESS\nQuality: {quality_upper}\n"
                 f"Events: {int(np.sum(hist))}\n"
+                f"Peaks used: {result['n_peaks']}\n"
                 f"χ²/ndf: {result['chi2_dof']:.2f}")
     else:
         info = f"STATUS: FAILED\nEvents: {int(np.sum(hist))}"
-    bbox_c = 'lightgreen' if quality_upper == 'GOOD' else 'lightcoral'
+    bbox_c = 'lightgreen' if q_sub == 'good' else ('lightyellow' if q_sub == 'bad' else 'lightcoral')
     ax1.text(0.02, 0.98, info, transform=ax1.transAxes, va='top', fontsize=8,
              family='monospace', bbox=dict(boxstyle='round', facecolor=bbox_c, alpha=0.7))
 
@@ -558,7 +669,6 @@ def plot_channel_fit(result, plot_dir, quality_label):
                  ha='center', va='center', fontsize=12, color='red')
 
     plt.tight_layout()
-    q_sub = quality_label.split('_')[-1]
     q_dir = os.path.join(plot_dir, q_sub)
     os.makedirs(q_dir, exist_ok=True)
     fig.savefig(os.path.join(q_dir, f"ch{ch_id:04d}_{quality_label}.png"),
@@ -574,46 +684,50 @@ def write_comparison_txt(results, run_name, out_dir):
     path = os.path.join(out_dir, f'{run_name}_classification_comparison.txt')
 
     with open(path, 'w') as f:
-        f.write(f"{'='*100}\n")
+        f.write(f"{'='*110}\n")
         f.write(f"CLASSIFICATION COMPARISON — {run_name}\n")
         f.write(f"Total channels analysed: {n_total}\n")
-        f.write(f"{'='*100}\n\n")
+        f.write(f"NOTE: 'good' requires n_peaks >= 3; channels with n_peaks < 3 are classified as 'bad'\n")
+        f.write(f"{'='*110}\n\n")
 
-        # Header
-        f.write(f"{'Method':<45} {'Good':<18} {'Bad':<18} {'Failed':<18}\n")
-        f.write(f"{'-'*100}\n")
+        # Summary header
+        f.write(f"{'Method':<50} {'Good≥3pk':<16} {'Bad':<14} {'Failed':<14}\n")
+        f.write(f"{'-'*110}\n")
 
         method_splits = {}
         for mk, cfn in CLASSIFIERS.items():
             g, b, fl = split_results(results, cfn)
             method_splits[mk] = (g, b, fl)
             ng, nb, nf = len(g), len(b), len(fl)
-            pg = 100*ng/n_total if n_total else 0
-            pb = 100*nb/n_total if n_total else 0
-            pf = 100*nf/n_total if n_total else 0
-            f.write(f"{METHOD_LABELS[mk]:<45} {ng:>5} ({pg:>5.1f}%)   "
-                    f"{nb:>5} ({pb:>5.1f}%)   {nf:>5} ({pf:>5.1f}%)\n")
+            pg  = 100*ng  / n_total if n_total else 0
+            pb  = 100*nb  / n_total if n_total else 0
+            pf  = 100*nf  / n_total if n_total else 0
+            f.write(f"{METHOD_LABELS[mk]:<50} "
+                    f"{ng:>5} ({pg:>5.1f}%)  "
+                    f"{nb:>5} ({pb:>5.1f}%)  "
+                    f"{nf:>5} ({pf:>5.1f}%)\n")
 
-        f.write(f"\n{'='*100}\n")
+        f.write(f"\n{'='*110}\n")
         f.write(f"DETAILED STATISTICS PER METHOD\n")
-        f.write(f"{'='*100}\n")
+        f.write(f"{'='*110}\n")
 
         for mk in CLASSIFIERS:
             g, b, fl = method_splits[mk]
-            f.write(f"\n{'─'*100}\n")
+            f.write(f"\n{'─'*110}\n")
             f.write(f"{METHOD_LABELS[mk]}\n")
-            f.write(f"{'─'*100}\n")
+            f.write(f"{'─'*110}\n")
 
-            for cat_name, cat_list in [('GOOD FITS', g), ('BAD FITS', b)]:
+            for cat_name, cat_list in [('GOOD FITS (≥3 peaks)', g),
+                                        ('BAD FITS', b)]:
                 f.write(f"\n  {cat_name} ({len(cat_list)} channels):\n")
                 if not cat_list:
                     f.write(f"    (none)\n")
                     continue
 
-                gains = [r['gain'] for r in cat_list if r['gain'] > 0]
-                intercepts = [r['intercept'] for r in cat_list]
-                chi2s = [r['chi2_dof'] for r in cat_list if r['chi2_dof'] > 0]
-                r2s = [r['linear_r2'] for r in cat_list if r['linear_r2'] > 0]
+                gains      = [r['gain']       for r in cat_list if r['gain'] > 0]
+                intercepts = [r['intercept']  for r in cat_list]
+                chi2s      = [r['chi2_dof']   for r in cat_list if r['chi2_dof'] > 0]
+                r2s        = [r['linear_r2']  for r in cat_list if r['linear_r2'] > 0]
 
                 for dist_name, vals in [('Gain (ADC/PE)', gains),
                                          ('Intercept (ADC)', intercepts),
@@ -624,9 +738,9 @@ def write_comparison_txt(results, run_name, out_dir):
                             f"min={s['min']:>10.3f}  max={s['max']:>10.3f}  "
                             f"mean={s['mean']:>10.3f}  RMS={s['rms']:>10.3f}\n")
 
-        f.write(f"\n{'='*100}\n")
+        f.write(f"\n{'='*110}\n")
         f.write(f"END OF COMPARISON\n")
-        f.write(f"{'='*100}\n")
+        f.write(f"{'='*110}\n")
 
     logging.info(f"Saved comparison: {path}")
 
@@ -744,7 +858,7 @@ def main():
         logging.info(f"Classification: {METHOD_LABELS[mk]}")
         good, bad, failed = split_results(results, cfn)
         ng, nb, nf = len(good), len(bad), len(failed)
-        logging.info(f"  Good: {ng}   Bad: {nb}   Failed: {nf}")
+        logging.info(f"  Good (≥3 peaks): {ng}   Bad: {nb}   Failed: {nf}")
 
         # Save CSV/TXT per category
         save_results_csv_txt(good,   os.path.join(args.output_dir, f'{args.run_name}_{mk}_good'))
@@ -770,9 +884,9 @@ def main():
                 return random.sample(lst, min(100, len(lst))) if lst else []
             return lst
 
-        for r in tqdm(select(good_A, args.plots), desc="Good plots"):
+        for r in tqdm(select(good_A,   args.plots), desc="Good plots"):
             plot_channel_fit(r, plot_dir, 'root_multigauss_good')
-        for r in tqdm(select(bad_A, args.plots), desc="Bad plots"):
+        for r in tqdm(select(bad_A,    args.plots), desc="Bad plots"):
             plot_channel_fit(r, plot_dir, 'root_multigauss_bad')
         for r in tqdm(select(failed_A, args.plots), desc="Failed plots"):
             plot_channel_fit(r, plot_dir, 'root_multigauss_failed')
