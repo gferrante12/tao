@@ -21,7 +21,7 @@ set -e
 # ██  USER FLAGS — edit these to control what runs  ██
 # =====================================================
 RUN_STABLE=true                 # gain_calibration_stable.py
-RUN_EXPERIMENTAL=false          # gain_calibration_experimental.py
+RUN_EXPERIMENTAL=true           # gain_calibration_experimental.py
 RUN_GAIN_VS_TIME=true           # gain_vs_time.py
 
 PLOTS_MODE="sample"             # none / sample / all
@@ -69,7 +69,7 @@ case $CLUSTER in
         BASE_DIR="/storage/gpfs_data/juno/junofs/users/gferrante/TAO/data_analysis/energy_spectrum"
         SCRIPTS_PY="/storage/gpfs_data/juno/junofs/users/gferrante/TAO/data_analysis/energy_spectrum/-scripts/1-gain_calibration"
         PYTHON_ENV_ROOT="/storage/gpfs_data/juno/junofs/users/gferrante/python_env"
-        CHARGE_BASE="${BASE_DIR}/charge_extraction"
+        CHARGE_BASE="${BASE_DIR}/0-extract_QT_results"
         RTRAW_BASE="/storage/gpfs_data/juno/junofs/production/storm/dirac/juno/tao-rtraw"
         USE_EOS_CLI=false
         ;;
@@ -77,7 +77,7 @@ case $CLUSTER in
         BASE_DIR="/junofs/users/gferrante/TAO/data_analysis/energy_spectrum"
         SCRIPTS_PY="/junofs/users/gferrante/TAO/data_analysis/energy_spectrum/-scripts/1-gain_calibration"
         PYTHON_ENV_ROOT="/junofs/users/gferrante/python_env"
-        CHARGE_BASE="${BASE_DIR}/charge_extraction"
+        CHARGE_BASE="${BASE_DIR}/0-extract_QT_results"
         RTRAW_BASE="/eos/juno/tao-rtraw"
         EOS_SERVER="root://junoeos01.ihep.ac.cn"
         USE_EOS_CLI=true
@@ -102,7 +102,7 @@ echo ""
 # =====================================================
 # Locate merged CHARGE ROOT file
 # =====================================================
-MERGED_CHARGE_DIR="${CHARGE_BASE}/RUN${RUN}/merged"
+MERGED_CHARGE_DIR="${CHARGE_BASE}/charge_merged"
 MERGED_ROOT=""
 
 # Try to find the merged file
@@ -134,10 +134,10 @@ echo ""
 # =====================================================
 # Directory setup
 # =====================================================
-OUTPUT_BASE="${BASE_DIR}/gain_calibration/RUN${RUN}"
-SCRIPTS_DIR="${OUTPUT_BASE}/scripts_$(date +%Y%m%d_%H%M%S)"
-OUTERR_DIR="${SCRIPTS_DIR}/out-err"
-LOGS_DIR="${BASE_DIR}/logs/RUN${RUN}/gain_calibration"
+SCRIPTS_DIR="${SCRIPTS_PY}/launchers/scripts_$(date +%Y%m%d_%H%M%S)"
+OUTERR_DIR="${SCRIPTS_PY}/out-err"
+OUTPUT_BASE="${BASE_DIR}/1-gain_calibration_results/RUN${RUN}"
+LOGS_DIR="${BASE_DIR}/logs/RUN${RUN}/1-gain_calibration_results"
 
 mkdir -p "$SCRIPTS_DIR" "$OUTERR_DIR" "$LOGS_DIR"
 
@@ -292,7 +292,7 @@ if [ "$RUN_GAIN_VS_TIME" = true ]; then
     echo "Generating gain_vs_time job..."
     GVT_OUT="${OUTPUT_BASE}/gain_vs_time"
     GVT_JOB="${SCRIPTS_DIR}/gain_vs_time_${RUN}.sh"
-    SINGLE_CHARGE_DIR="${CHARGE_BASE}/RUN${RUN}/single"
+    SINGLE_CHARGE_DIR=$(ls -dt $CHARGE_BASE/charge_single/RUN${RUN}/*/  2>/dev/null | head -1)
 
     cat > "$GVT_JOB" <<EOFGVT
 #!/bin/bash
