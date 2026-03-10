@@ -59,8 +59,8 @@ PEAK_WIDTH         = 1200.0
 MAX_SIGMA          = 3000.0
 FIRST_PEAK_MIN     = 1500
 FIRST_PEAK_MAX     = 9000
-EXPECTED_GAIN_MIN  = 3200
-EXPECTED_GAIN_MAX  = 8500
+EXPECTED_GAIN_MIN  = 3000
+EXPECTED_GAIN_MAX  = 9000
 EXPECTED_GAIN_DEFAULT = 6000
 CHI2_MAX           = 160.0
 LINEAR_R2_MIN      = 0.90
@@ -311,7 +311,14 @@ def fit_emg_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
     }}
     """
     ROOT.gInterpreter.Declare(cpp_code)
-    f1 = ROOT.TF1(f"femg_{ch_id}", f"emg_model_{ch_id}", fit_min, fit_max, n_par)
+    # Use the C++ function pointer (not a TFormula expression string).
+    # The 5-arg TF1(name, string, ..., npar) constructor interprets the 2nd arg
+    # as a TFormula expression where "p" is not a valid token.
+    # Instead, retrieve the compiled function via getattr(ROOT, ...) and pass
+    # the pointer directly.
+    f1 = ROOT.TF1(f"femg_{ch_id}",
+                   getattr(ROOT, f"emg_model_{ch_id}"),
+                   fit_min, fit_max, n_par)
 
     # Initial values from multigauss fit or from peaks
     if mg_params:
@@ -445,7 +452,13 @@ def fit_multigauss_ap_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
     }}
     """
     ROOT.gInterpreter.Declare(cpp_code)
-    f1 = ROOT.TF1(f"fap_{ch_id}", f"ap_model_{ch_id}", fit_min, fit_max, n_par)
+    # Use the C++ function pointer — same fix as EMG above.
+    # Passing f"ap_model_{ch_id}" as a string makes ROOT parse it as a
+    # TFormula expression, which resolves to a function pointer type
+    # (double(*)(double*,double*)) instead of a double → Cling type error.
+    f1 = ROOT.TF1(f"fap_{ch_id}",
+                   getattr(ROOT, f"ap_model_{ch_id}"),
+                   fit_min, fit_max, n_par)
 
     # Initial values
     mu1_init = mg_params[1] if mg_params else peaks[0]

@@ -2,7 +2,7 @@
 set -e
 
 # =====================================================
-# launch_gain_calibration.sh - v1.0
+# launch_gain_calibration.sh - v1.1
 # Standalone launcher for gain calibration pipeline.
 # Generates job scripts for:
 #   - gain_calibration_stable.py     (multi-Gaussian, 3 classification methods)
@@ -134,10 +134,22 @@ echo ""
 # =====================================================
 # Directory setup
 # =====================================================
-SCRIPTS_DIR="${SCRIPTS_PY}/launchers/scripts_$(date +%Y%m%d_%H%M%S)"
-OUTERR_DIR="${SCRIPTS_PY}/out-err"
+SCRIPTS_DIR="${SCRIPTS_PY}/launchers/RUN${RUN}"
+OUTERR_DIR="${SCRIPTS_PY}/launchers/out-err"
 OUTPUT_BASE="${BASE_DIR}/1-gain_calibration_results/RUN${RUN}"
 LOGS_DIR="${BASE_DIR}/logs/RUN${RUN}/1-gain_calibration_results"
+
+# Guard: warn if launcher folder already exists
+if [ -d "$SCRIPTS_DIR" ]; then
+    echo "WARNING: Launcher folder already exists:"
+    echo "  $SCRIPTS_DIR"
+    echo "Existing scripts will be overwritten. Continue? [y/N]"
+    read -r REPLY
+    if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 1
+    fi
+fi
 
 mkdir -p "$SCRIPTS_DIR" "$OUTERR_DIR" "$LOGS_DIR"
 
@@ -290,7 +302,7 @@ fi
 # =====================================================
 if [ "$RUN_GAIN_VS_TIME" = true ]; then
     echo "Generating gain_vs_time job..."
-    GVT_OUT="${OUTPUT_BASE}/gain_vs_time"
+    GVT_OUT="${OUTPUT_BASE}/gain_vs_time_$(date +%Y%m%d_%H%M%S)"
     GVT_JOB="${SCRIPTS_DIR}/gain_vs_time_${RUN}.sh"
     SINGLE_CHARGE_DIR=$(ls -dt $CHARGE_BASE/charge_single/RUN${RUN}/*/  2>/dev/null | head -1)
 
