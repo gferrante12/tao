@@ -6,7 +6,7 @@ set -e
 # Standalone launcher for gain calibration pipeline.
 # Generates job scripts for:
 #   - gain_calibration_stable.py     (multi-Gaussian, 3 classification methods)
-#   - gain_calibration_experimental.py (EMG + AP models, N channels)
+#   - gain_calibration_experimental.py (EMG + AP models, all channels)
 #   - gain_vs_time.py                (gain evolution over time)
 #
 # Each tool can be enabled/disabled via flags below.
@@ -24,8 +24,8 @@ RUN_STABLE=true                 # gain_calibration_stable.py
 RUN_EXPERIMENTAL=true           # gain_calibration_experimental.py
 RUN_GAIN_VS_TIME=true           # gain_vs_time.py
 
-PLOTS_MODE="sample"             # none / sample / all
-N_EXPERIMENTAL_CH=3             # channels for experimental
+SKIP_PLOTS=false                # true → --no-plots (skip channel fit PNGs)
+N_EXPERIMENTAL_CH=3             # (unused by default; kept for manual --n-channels override)
 USE_RAW_HISTS=false             # --use-raw flag (false → H_adcClean_*)
 MAX_RUNTIME=7200                # 2h per job
 # =====================================================
@@ -39,8 +39,7 @@ if [ -z "$1" ]; then
     echo "  RUN_STABLE=$RUN_STABLE"
     echo "  RUN_EXPERIMENTAL=$RUN_EXPERIMENTAL"
     echo "  RUN_GAIN_VS_TIME=$RUN_GAIN_VS_TIME"
-    echo "  PLOTS_MODE=$PLOTS_MODE"
-    echo "  N_EXPERIMENTAL_CH=$N_EXPERIMENTAL_CH"
+    echo "  SKIP_PLOTS=$SKIP_PLOTS"
     echo ""
     exit 1
 fi
@@ -96,7 +95,7 @@ echo "RUN            : $RUN"
 echo "Stable         : $RUN_STABLE"
 echo "Experimental   : $RUN_EXPERIMENTAL"
 echo "Gain vs Time   : $RUN_GAIN_VS_TIME"
-echo "Plots mode     : $PLOTS_MODE"
+echo "Skip plots     : $SKIP_PLOTS"
 echo ""
 
 # =====================================================
@@ -156,6 +155,8 @@ mkdir -p "$SCRIPTS_DIR" "$OUTERR_DIR" "$LOGS_DIR"
 RUN_NAME="RUN${RUN}"
 RAW_FLAG=""
 [ "$USE_RAW_HISTS" = true ] && RAW_FLAG="--use-raw"
+PLOTS_FLAG=""
+[ "$SKIP_PLOTS" = true ] && PLOTS_FLAG="--no-plots"
 
 # =====================================================
 # Helper: generate cluster-specific submit wrapper
@@ -235,7 +236,7 @@ python3 "${SCRIPTS_PY}/gain_calibration_stable.py" \\
     "${STABLE_OUT}" \\
     "${RUN_NAME}" \\
     ${RAW_FLAG} \\
-    --plots ${PLOTS_MODE}
+    ${PLOTS_FLAG}
 
 END_TIME=\$(date +%s)
 echo ""
@@ -266,7 +267,7 @@ exec > "\$LOG_FILE" 2>&1
 echo "=========================================="
 echo "Gain Calibration EXPERIMENTAL — RUN ${RUN}"
 echo "  Models: multigauss, EMG, multigauss_ap"
-echo "  Channels: ${N_EXPERIMENTAL_CH}"
+echo "  All channels (multiprocessing)"
 echo "=========================================="
 
 source "${JUNO_RELEASE}/setup-tao.sh"
@@ -278,12 +279,14 @@ mkdir -p "${EXPER_OUT}"
 
 START_TIME=\$(date +%s)
 
+#--n-channels ${N_EXPERIMENTAL_CH}
+
 python3 "${SCRIPTS_PY}/gain_calibration_experimental.py" \\
     "${MERGED_ROOT}" \\
     "${EXPER_OUT}" \\
     "${RUN_NAME}" \\
     ${RAW_FLAG} \\
-    --n-channels ${N_EXPERIMENTAL_CH}
+    ${PLOTS_FLAG}
 
 END_TIME=\$(date +%s)
 echo ""

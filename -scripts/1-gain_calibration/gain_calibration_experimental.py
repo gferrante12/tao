@@ -17,23 +17,45 @@ Models:
                       Adds 2 params: α (AP prob), Q_ap (AP charge)
                       Ref: Ziang Li slides, TAO JAN 2026
 
-TEST MODE: Only processes the first 3 channels to verify the fit pipeline.
+Processes ALL channels (multiprocessing).  One classification method (Method A
+from gain_calibration_stable.py) applied independently to each fit model.
+
+Outputs per model:
+  - RUNXXXX_{model}_{good|bad|failed}.csv / .txt
+  - RUNXXXX_fit_quality_piechart_{model}.png
+  - RUNXXXX_summary_plots_{model}.png      (2 rows: good / bad)
+  - plots_RUNXXXX/{good|bad|failed}/ch{XXXX}_{model}_fit.png
+  - plots_RUNXXXX/{good|bad|failed}/ch{XXXX}_{model}_linear.png
+
+Global:
+  - RUNXXXX_classification_comparison.txt  (cross-model table)
 
 Usage:
   python gain_calibration_experimental.py input.root output_dir RUN1295
-  python gain_calibration_experimental.py input.root output_dir RUN1295 --n-channels 10
+  python gain_calibration_experimental.py input.root output_dir RUN1295 --use-raw
+  python gain_calibration_experimental.py input.root output_dir RUN1295 --no-plots
 """
 
 import argparse
+import csv
 import logging
-import os
-import sys
 import math
+import os
+import random
+import sys
+from multiprocessing import Pool, cpu_count
 
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib import gridspec
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(it, **kw):
+        return it
 
 try:
     import ROOT
@@ -63,7 +85,25 @@ EXPECTED_GAIN_MIN  = 3000
 EXPECTED_GAIN_MAX  = 9000
 EXPECTED_GAIN_DEFAULT = 6000
 CHI2_MAX           = 160.0
-LINEAR_R2_MIN      = 0.90
+LINEAR_R2_MIN      = 0.99
+
+MODEL_NAMES  = ['multigauss', 'emg', 'multigauss_ap']
+MODEL_LABELS = {
+    'multigauss':    'Multi-Gauss',
+    'emg':           'EMG (CT tail)',
+    'multigauss_ap': 'Multi-Gauss + AP',
+}
+MODEL_COLORS = {
+    'multigauss':    '#1f77b4',
+    'emg':           '#2ca02c',
+    'multigauss_ap': '#ff7f0e',
+}
+PEAK_COLORS = [
+    '#e6194b', '#3cb44b', '#4363d8', '#f58231',
+    '#911eb4', '#42d4f4', '#f032e6', '#bfef45',
+]
+
+N_AP = 4  # max afterpulse order (used in multigauss_ap)
 
 # =============================================================================
 # NUMPY HELPER FUNCTIONS
@@ -97,7 +137,7 @@ def peak_sigma(n, sigma_pe, sigma_base):
 # SECONDARY: hand-written Poisson chi2
 # =============================================================================
 def chi2_poisson_manual(y_obs, y_pred):
-    """Poisson-weighted χ²: Σ (y_obs - y_pred)² / max(y_obs, 1)."""
+    """Poisson-weighted chi2: sum (y_obs - y_pred)^2 / max(y_obs, 1)."""
     w = 1.0 / np.maximum(y_obs, 1.0)
     return float(np.sum(w * (y_obs - y_pred)**2))
 
@@ -232,7 +272,6 @@ def fit_multigauss_root(ch_id, hist_data, peaks, est_gain):
         del h, f1
         return None
 
-    # ROOT integrated chi2
     chi2_root = fr.Chi2()
     ndf_root  = fr.Ndf()
     chi2_ndf  = chi2_root / ndf_root if ndf_root > 0 else -1
@@ -240,7 +279,6 @@ def fit_multigauss_root(ch_id, hist_data, peaks, est_gain):
     params = [fr.Parameter(i) for i in range(3*n_peaks)]
     param_errs = [fr.ParError(i) for i in range(3*n_peaks)]
 
-    # Secondary: manual Poisson chi2
     mask = (BIN_CENTERS >= fit_min) & (BIN_CENTERS <= fit_max)
     x_d = BIN_CENTERS[mask]
     y_d = hist_data[mask]
@@ -263,8 +301,6 @@ def fit_multigauss_root(ch_id, hist_data, peaks, est_gain):
 def fit_emg_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
     """
     EMG fit: each peak is an Exponential Modified Gaussian.
-    Uses ROOT TF1 with a C++ functor defined inline.
-
     Parameters: [A_1, mu_1, sigma_pe, sigma_base, gain, tau, A_2, A_3, ...]
     Total: 6 + (n_peaks - 1) free amplitudes
     """
@@ -281,14 +317,10 @@ def fit_emg_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
     fit_min = peaks[0] - constraints['peak_width'] * constraints['fit_margin']
     fit_max = peaks[-1] + constraints['peak_width'] * constraints['fit_margin']
 
-    # Parameters: [A1, mu1, sigma_pe, sigma_base, gain, tau, A2, A3, ..., A_n]
     n_par = 6 + (n_peaks - 1)
 
-    # Define C++ functor for EMG
     cpp_code = f"""
     double emg_model_{ch_id}(double *x, double *p) {{
-        // p[0]=A1, p[1]=mu1, p[2]=sigma_pe, p[3]=sigma_base, p[4]=gain, p[5]=tau
-        // p[6..]=A2, A3, ...
         int n_peaks = {n_peaks};
         double val = 0.0;
         double mu1 = p[1], gain = p[4], sp = p[2], sb = p[3], tau = p[5];
@@ -300,7 +332,6 @@ def fit_emg_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
             double mu_n = mu1 + (n - 1) * gain;
             double sig_n = sqrt(fmax(n * sp*sp + sb*sb, 1.0));
 
-            // EMG: A/(2*tau) * exp((mu-x)/tau + sig^2/(2*tau^2)) * erfc(sig/(tau*sqrt2) - (x-mu)/(sig*sqrt2))
             double exp_arg = (mu_n - x[0]) / tau + sig_n*sig_n / (2.0*tau*tau);
             if (exp_arg > 300) exp_arg = 300;
             if (exp_arg < -500) exp_arg = -500;
@@ -311,21 +342,14 @@ def fit_emg_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
     }}
     """
     ROOT.gInterpreter.Declare(cpp_code)
-    # Use the C++ function pointer (not a TFormula expression string).
-    # The 5-arg TF1(name, string, ..., npar) constructor interprets the 2nd arg
-    # as a TFormula expression where "p" is not a valid token.
-    # Instead, retrieve the compiled function via getattr(ROOT, ...) and pass
-    # the pointer directly.
     f1 = ROOT.TF1(f"femg_{ch_id}",
                    getattr(ROOT, f"emg_model_{ch_id}"),
                    fit_min, fit_max, n_par)
 
-    # Initial values from multigauss fit or from peaks
     if mg_params:
-        # Use multigauss result to seed EMG
         mu1_init = mg_params[1]
         gain_init = est_gain
-        sig_pe_init = mg_params[2]  # sigma of 1PE peak
+        sig_pe_init = mg_params[2]
         sig_base_init = 100.0
     else:
         mu1_init = peaks[0]
@@ -333,16 +357,15 @@ def fit_emg_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
         sig_pe_init = constraints['peak_width']
         sig_base_init = 100.0
 
-    tau_init = 0.05 * gain_init  # ~5% of gain as initial CT tau
+    tau_init = 0.05 * gain_init
 
-    f1.SetParameter(0, h.GetBinContent(h.FindBin(peaks[0])))  # A1
+    f1.SetParameter(0, h.GetBinContent(h.FindBin(peaks[0])))
     f1.SetParameter(1, mu1_init)
     f1.SetParameter(2, sig_pe_init)
     f1.SetParameter(3, sig_base_init)
     f1.SetParameter(4, gain_init)
     f1.SetParameter(5, tau_init)
 
-    # Limits
     f1.SetParLimits(0, 1, 1e7)
     f1.SetParLimits(1, mu1_init - 0.3*est_gain, mu1_init + 0.3*est_gain)
     f1.SetParLimits(2, 100, 0.5*est_gain)
@@ -365,12 +388,10 @@ def fit_emg_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
     params = [fr.Parameter(i) for i in range(n_par)]
     param_errs = [fr.ParError(i) for i in range(n_par)]
 
-    # Compute p_ct estimate: tau / gain
     tau_fit = params[5]
     gain_fit = params[4]
     p_ct_est = tau_fit / gain_fit if gain_fit > 0 else 0
 
-    # Manual Poisson chi2
     mask = (BIN_CENTERS >= fit_min) & (BIN_CENTERS <= fit_max)
     x_d = BIN_CENTERS[mask]
     y_d = hist_data[mask]
@@ -400,14 +421,11 @@ def fit_emg_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
 def fit_multigauss_ap_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
     """
     Multi-Gauss + geometric afterpulse (SYSU model).
-    f_n = A_n * Σ_{i=0}^{N_ap} (1-n*alpha)*(n*alpha)^i * G(mu_n + i*Q_ap, sigma_n)
-
     Parameters: [A1, mu1, sigma_pe, sigma_base, gain, alpha, Q_ap, A2, A3, ...]
     Total: 7 + (n_peaks - 1)
     """
     n_peaks = len(peaks)
     constraints = get_adaptive_constraints(est_gain)
-    N_AP = 4  # max afterpulse order
 
     nbins = len(hist_data)
     xmin = BIN_CENTERS[0] - BIN_WIDTH/2
@@ -423,8 +441,6 @@ def fit_multigauss_ap_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
 
     cpp_code = f"""
     double ap_model_{ch_id}(double *x, double *p) {{
-        // p[0]=A1, p[1]=mu1, p[2]=sigma_pe, p[3]=sigma_base, p[4]=gain
-        // p[5]=alpha, p[6]=Q_ap, p[7..]=A2, A3, ...
         int n_peaks = {n_peaks};
         int N_AP = {N_AP};
         double val = 0.0;
@@ -452,15 +468,10 @@ def fit_multigauss_ap_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
     }}
     """
     ROOT.gInterpreter.Declare(cpp_code)
-    # Use the C++ function pointer — same fix as EMG above.
-    # Passing f"ap_model_{ch_id}" as a string makes ROOT parse it as a
-    # TFormula expression, which resolves to a function pointer type
-    # (double(*)(double*,double*)) instead of a double → Cling type error.
     f1 = ROOT.TF1(f"fap_{ch_id}",
                    getattr(ROOT, f"ap_model_{ch_id}"),
                    fit_min, fit_max, n_par)
 
-    # Initial values
     mu1_init = mg_params[1] if mg_params else peaks[0]
     sig_pe_init = mg_params[2] if mg_params else constraints['peak_width']
     gain_init = est_gain
@@ -470,16 +481,16 @@ def fit_multigauss_ap_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
     f1.SetParameter(2, sig_pe_init)
     f1.SetParameter(3, 100.0)
     f1.SetParameter(4, gain_init)
-    f1.SetParameter(5, 0.03)  # alpha ~ 3% afterpulse
-    f1.SetParameter(6, 0.25 * gain_init)  # Q_ap ~ 25% of gain
+    f1.SetParameter(5, 0.03)
+    f1.SetParameter(6, 0.25 * gain_init)
 
     f1.SetParLimits(0, 1, 1e7)
     f1.SetParLimits(1, mu1_init - 0.3*est_gain, mu1_init + 0.3*est_gain)
     f1.SetParLimits(2, 100, 0.5*est_gain)
     f1.SetParLimits(3, 10, 0.3*est_gain)
     f1.SetParLimits(4, EXPECTED_GAIN_MIN, EXPECTED_GAIN_MAX)
-    f1.SetParLimits(5, 0.001, 0.15)  # alpha
-    f1.SetParLimits(6, 0.05*est_gain, 0.5*est_gain)  # Q_ap
+    f1.SetParLimits(5, 0.001, 0.15)
+    f1.SetParLimits(6, 0.05*est_gain, 0.5*est_gain)
 
     for j in range(1, n_peaks):
         amp = h.GetBinContent(h.FindBin(peaks[j]))
@@ -496,7 +507,6 @@ def fit_multigauss_ap_root(ch_id, hist_data, peaks, est_gain, mg_params=None):
     params = [fr.Parameter(i) for i in range(n_par)]
     param_errs = [fr.ParError(i) for i in range(n_par)]
 
-    # Manual chi2
     mask = (BIN_CENTERS >= fit_min) & (BIN_CENTERS <= fit_max)
     x_d = BIN_CENTERS[mask]
     y_d = hist_data[mask]
@@ -535,7 +545,7 @@ def linear_fit_gain(n_peaks, params, model_name):
     """Extract peak means from fitted parameters, do linear fit for gain."""
     if model_name == 'multigauss':
         mus = [params[3*j + 1] for j in range(n_peaks)]
-        mu_errs = [50.0] * n_peaks  # approx
+        mu_errs = [50.0] * n_peaks
     elif model_name == 'emg':
         mu1, gain = params[1], params[4]
         mus = [mu1 + (n-1)*gain for n in range(1, n_peaks+1)]
@@ -563,139 +573,665 @@ def linear_fit_gain(n_peaks, params, model_name):
     ss_tot = float(np.sum((Y - Y.mean())**2))
     r2 = 1.0 - ss_res/ss_tot if ss_tot > 0 else 0
 
+    resid = Y - Y_pred
+    chi2_lin = float(np.sum(w * resid**2))
+    ndf_lin = n_peaks - 2
+    chi2_dof_lin = chi2_lin / ndf_lin if ndf_lin > 0 else -1.0
+
     return {'gain': gain_lin, 'gain_err': math.sqrt(max(Cov[1,1], 0)),
             'intercept': icept, 'intercept_err': math.sqrt(max(Cov[0,0], 0)),
-            'r2': r2}
+            'r2': r2, 'linear_chi2_dof': chi2_dof_lin}
 
 # =============================================================================
-# PLOTTING: comparison of models for one channel
+# MODEL PREDICTION (numpy, for plotting)
 # =============================================================================
-def plot_channel_comparison(ch_id, hist_data, peaks, fit_results, out_dir, run_name):
-    """Plot ADC histogram with overlaid fits from all models."""
-    n_models = len(fit_results)
-    fig, axes = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1]})
-    ax_main = axes[0]
-    ax_res  = axes[1]
+def model_predict_np(model_name, x, params, n_peaks):
+    """Evaluate the model on x given fitted params."""
+    if model_name == 'multigauss':
+        return multi_gauss_np(x, *params)
+    elif model_name == 'emg':
+        y = np.zeros_like(x)
+        for n in range(1, n_peaks+1):
+            An = params[0] if n == 1 else params[5 + n - 1]
+            mu_n = params[1] + (n-1)*params[4]
+            sig_n = peak_sigma(n, params[2], params[3])
+            y += emg_single_np(x, An, mu_n, sig_n, params[5])
+        return y
+    elif model_name == 'multigauss_ap':
+        y = np.zeros_like(x)
+        alpha = max(0, min(params[5], 0.99/max(n_peaks,1)))
+        qap   = max(0, min(params[6], 0.95*abs(params[4])))
+        for n in range(1, n_peaks+1):
+            An = params[0] if n == 1 else params[6 + n - 1]
+            mu_n = params[1] + (n-1)*params[4]
+            sig_n = peak_sigma(n, params[2], params[3])
+            na = n * alpha
+            for i in range(N_AP + 1):
+                wi = (1.0 - na) * (na**i)
+                if wi < 1e-12: break
+                y += An * wi * gaussian_np(x, 1.0, mu_n + i*qap, sig_n)
+        return y
+    return np.zeros_like(x)
 
-    ax_main.step(BIN_CENTERS, hist_data, where='mid', color='black', lw=0.8, label='Data')
+# =============================================================================
+# PROCESS ONE CHANNEL (all 3 models)
+# =============================================================================
+def process_channel(ch_id, hist_data):
+    """
+    Fit all three models on one channel.
+    Returns a dict with per-model sub-dicts compatible with stable classification.
+    """
+    base = {
+        'channel_id': ch_id,
+        'hist': hist_data,
+        'n_peaks': 0,
+        'detected_peaks': [],
+    }
 
-    # Mark peaks
-    for i, pk in enumerate(peaks):
-        idx = np.abs(BIN_CENTERS - pk).argmin()
-        ax_main.plot(pk, hist_data[idx], 'rv', markersize=8,
-                     label=f'{i+1} PE' if i == 0 else '')
+    # Per-model results
+    model_results = {}
+    for mname in MODEL_NAMES:
+        model_results[mname] = {
+            'fit_status': -1,
+            'gain': 0.0, 'gain_error': 0.0,
+            'intercept': 0.0, 'intercept_error': 0.0,
+            'chi2_dof': -1.0, 'linear_r2': 0.0, 'linear_chi2_dof': -1.0,
+            'n_peaks': 0,
+            'fit_params': None, 'fit_min': 0, 'fit_max': 0,
+            'extra': {},
+        }
 
-    model_colors = {'multigauss': '#1f77b4', 'emg': '#2ca02c', 'multigauss_ap': '#ff7f0e'}
-    model_labels = {'multigauss': 'Multi-Gauss', 'emg': 'EMG (CT tail)',
-                    'multigauss_ap': 'Multi-Gauss + AP'}
+    if np.sum(hist_data) < 1000:
+        base['model_results'] = model_results
+        return base
 
-    for mname, fr in fit_results.items():
-        if fr is None:
-            continue
-        mask = (BIN_CENTERS >= fr['fit_min']) & (BIN_CENTERS <= fr['fit_max'])
-        x_d = BIN_CENTERS[mask]
-        y_d = hist_data[mask]
+    peaks = detect_peaks_tspectrum(hist_data)
+    if len(peaks) < 2:
+        base['model_results'] = model_results
+        return base
 
-        # Compute model prediction
-        if mname == 'multigauss':
-            y_pred = multi_gauss_np(x_d, *fr['params'])
-        elif mname == 'emg':
-            y_pred = np.zeros_like(x_d)
-            n_pk = len(peaks)
-            for n in range(1, n_pk+1):
-                An = fr['params'][0] if n == 1 else fr['params'][5 + n - 1]
-                mu_n = fr['params'][1] + (n-1)*fr['params'][4]
-                sig_n = peak_sigma(n, fr['params'][2], fr['params'][3])
-                y_pred += emg_single_np(x_d, An, mu_n, sig_n, fr['params'][5])
-        elif mname == 'multigauss_ap':
-            y_pred = np.zeros_like(x_d)
-            n_pk = len(peaks)
-            alpha = max(0, min(fr['params'][5], 0.99/max(n_pk,1)))
-            qap   = max(0, min(fr['params'][6], 0.95*abs(fr['params'][4])))
-            for n in range(1, n_pk+1):
-                An = fr['params'][0] if n == 1 else fr['params'][6 + n - 1]
-                mu_n = fr['params'][1] + (n-1)*fr['params'][4]
-                sig_n = peak_sigma(n, fr['params'][2], fr['params'][3])
-                na = n * alpha
-                for i in range(5):
-                    wi = (1.0 - na) * (na**i)
-                    if wi < 1e-12: break
-                    y_pred += An * wi * gaussian_np(x_d, 1.0, mu_n + i*qap, sig_n)
+    est_gain = estimate_gain_from_peaks(peaks)
+    base['detected_peaks'] = peaks
+    base['n_peaks'] = len(peaks)
+
+    def _fill(mr, raw, mname):
+        """Populate model_results dict from raw fit output."""
+        if raw is None:
+            return
+        lin = linear_fit_gain(len(peaks), raw['params'], mname)
+        mr['fit_status'] = 1
+        mr['n_peaks'] = len(peaks)
+        mr['chi2_dof'] = raw['chi2_ndf_root']
+        mr['chi2_ndf_manual'] = raw.get('chi2_ndf_manual', -1)
+        mr['fit_params'] = raw['params']
+        mr['fit_min'] = raw['fit_min']
+        mr['fit_max'] = raw['fit_max']
+        mr['extra'] = raw.get('extra', {})
+        if lin:
+            mr['gain'] = lin['gain']
+            mr['gain_error'] = lin['gain_err']
+            mr['intercept'] = lin['intercept']
+            mr['intercept_error'] = lin['intercept_err']
+            mr['linear_r2'] = lin['r2']
+            mr['linear_chi2_dof'] = lin['linear_chi2_dof']
+
+    # Model 1: multigauss
+    r1 = fit_multigauss_root(ch_id, hist_data, peaks, est_gain)
+    mg_seed = r1['params'] if r1 else None
+    _fill(model_results['multigauss'], r1, 'multigauss')
+
+    # Model 2: EMG
+    r2 = fit_emg_root(ch_id, hist_data, peaks, est_gain, mg_seed)
+    _fill(model_results['emg'], r2, 'emg')
+
+    # Model 3: multigauss_ap
+    r3 = fit_multigauss_ap_root(ch_id, hist_data, peaks, est_gain, mg_seed)
+    _fill(model_results['multigauss_ap'], r3, 'multigauss_ap')
+
+    base['model_results'] = model_results
+    return base
+
+
+def _worker(args):
+    ch_id, hist_data = args
+    return process_channel(ch_id, hist_data)
+
+
+# =============================================================================
+# CLASSIFICATION — Method A only (chi2/ndf + R2 + gain range + n_peaks >= 3)
+# =============================================================================
+def classify_A(mr):
+    """Classify a single per-model result dict."""
+    if mr['fit_status'] != 1:
+        return 'failed'
+    if mr['n_peaks'] < 3:
+        return 'bad'
+    if (mr['chi2_dof'] <= CHI2_MAX
+            and mr['linear_r2'] >= LINEAR_R2_MIN
+            and EXPECTED_GAIN_MIN <= mr['gain'] <= EXPECTED_GAIN_MAX):
+        return 'good'
+    return 'bad'
+
+
+def split_by_model(all_results, model_name):
+    """Split channel results into good / bad / failed for one model."""
+    good, bad, failed = [], [], []
+    for res in all_results:
+        mr = res['model_results'][model_name]
+        # Attach channel-level info for CSV/plot convenience
+        row = dict(mr)
+        row['channel_id'] = res['channel_id']
+        row['hist'] = res['hist']
+        row['detected_peaks'] = res['detected_peaks']
+
+        cat = classify_A(mr)
+        if cat == 'good':
+            good.append(row)
+        elif cat == 'bad':
+            bad.append(row)
         else:
-            continue
+            failed.append(row)
+    return good, bad, failed
 
-        c2r = fr['chi2_ndf_root']
-        c2m = fr['chi2_ndf_manual']
-        lbl = f"{model_labels[mname]}: χ²/ndf(ROOT)={c2r:.2f}, χ²/ndf(Poisson)={c2m:.2f}"
-        ax_main.plot(x_d, y_pred, '-', color=model_colors[mname], lw=1.8, alpha=0.85, label=lbl)
 
-        # Residuals
-        residual = (y_d - y_pred) / np.sqrt(np.maximum(y_d, 1))
-        ax_res.plot(x_d, residual, '.', color=model_colors[mname], markersize=2, alpha=0.5)
+# =============================================================================
+# HELPER: distribution statistics (same as stable)
+# =============================================================================
+def dist_stats(values):
+    if not values:
+        return {'min': 0, 'max': 0, 'mean': 0, 'rms': 0, 'n': 0}
+    a = np.array(values)
+    return {'min': float(a.min()), 'max': float(a.max()),
+            'mean': float(a.mean()), 'rms': float(a.std()), 'n': len(a)}
 
-    ax_main.set_yscale('log')
-    ymax = hist_data.max()
-    if ymax > 0:
-        ax_main.set_ylim(0.5, ymax * 200)
-    ax_main.set_ylabel('Counts')
-    ax_main.set_title(f'{run_name} — Channel {ch_id}: Model Comparison', fontsize=14, fontweight='bold')
-    ax_main.legend(fontsize=9, loc='upper right')
-    ax_main.grid(True, alpha=0.3)
 
-    ax_res.axhline(0, color='gray', lw=1)
-    ax_res.set_xlabel('ADC')
-    ax_res.set_ylabel('Pull (data−fit)/√data')
-    ax_res.set_ylim(-5, 5)
-    ax_res.grid(True, alpha=0.3)
+# =============================================================================
+# CSV / TXT OUTPUT (same format as stable)
+# =============================================================================
+def save_results_csv_txt(result_list, filepath_base):
+    csv_path = filepath_base + '.csv'
+    txt_path = filepath_base + '.txt'
 
-    # Info box with extra parameters
-    info_lines = []
-    for mname, fr in fit_results.items():
-        if fr is None:
-            info_lines.append(f"{model_labels[mname]}: FAILED")
-            continue
-        line = f"{model_labels[mname]}: χ²/ndf = {fr['chi2_ndf_root']:.2f}"
-        if 'extra' in fr and fr['extra']:
-            ex = fr['extra']
-            if 'p_ct_est' in ex:
-                line += f", p_ct ≈ {ex['p_ct_est']:.3f}"
-            if 'alpha' in ex:
-                line += f", α = {ex['alpha']:.4f}, Q_ap/G = {ex.get('Q_ap_rel',0):.3f}"
-        info_lines.append(line)
+    fieldnames = ['channel_id', 'gain', 'gain_error', 'intercept', 'intercept_error',
+                  'n_peaks', 'chi2_dof', 'linear_r2', 'linear_chi2_dof']
 
-    ax_main.text(0.02, 0.02, "\n".join(info_lines), transform=ax_main.transAxes,
-                 va='bottom', fontsize=8, family='monospace',
-                 bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
+    with open(csv_path, 'w', newline='') as cf:
+        writer = csv.DictWriter(cf, fieldnames=fieldnames, extrasaction='ignore')
+        writer.writeheader()
+        for r in result_list:
+            writer.writerow({k: r.get(k, '') for k in fieldnames})
 
+    with open(txt_path, 'w') as tf:
+        tf.write(f"{'Channel':<10} {'Gain':<12} {'Gain_Err':<12} {'Intercept':<14} "
+                 f"{'Int_Err':<12} {'N_Peaks':<10} {'Chi2/ndf':<12} {'R2':<10} "
+                 f"{'Lin_Chi2':<12}\n")
+        tf.write("=" * 104 + "\n")
+        for r in result_list:
+            tf.write(f"{r['channel_id']:<10} {r['gain']:<12.2f} {r['gain_error']:<12.2f} "
+                     f"{r['intercept']:<14.2f} {r['intercept_error']:<12.2f} "
+                     f"{r['n_peaks']:<10} {r['chi2_dof']:<12.3f} "
+                     f"{r['linear_r2']:<10.4f} {r.get('linear_chi2_dof', -1):<12.3f}\n")
+
+    logging.info(f"Saved {csv_path} and {txt_path}")
+
+
+# =============================================================================
+# PLOT: Pie chart per model
+# =============================================================================
+def plot_piechart(good, bad, failed, model_name, run_name, out_dir):
+    n_g, n_b, n_f = len(good), len(bad), len(failed)
+    n_tot = n_g + n_b + n_f
+    if n_tot == 0:
+        return
+    pct = lambda n: 100.0 * n / n_tot
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    sizes  = [n_g, n_b, n_f]
+    labels = [
+        f'Good (>=3 peaks)\n{n_g} ({pct(n_g):.1f}%)',
+        f'Bad\n{n_b} ({pct(n_b):.1f}%)',
+        f'Failed\n{n_f} ({pct(n_f):.1f}%)',
+    ]
+    colors  = ['#90EE90', '#FFA07A', '#FFB6C6']
+    explode = [0.05 if s / n_tot > 0.10 else 0.15 for s in sizes]
+
+    nonzero = [(s, l, c, e) for s, l, c, e in zip(sizes, labels, colors, explode) if s > 0]
+    if nonzero:
+        sizes_, labels_, colors_, explode_ = zip(*nonzero)
+    else:
+        sizes_, labels_, colors_, explode_ = sizes, labels, colors, explode
+
+    wedges, texts = ax.pie(sizes_, explode=explode_, labels=labels_, colors=colors_,
+                           startangle=90, labeldistance=1.15,
+                           textprops=dict(fontsize=11, fontweight='bold'))
+
+    for i in range(len(texts)):
+        for j in range(i + 1, len(texts)):
+            pos_i = texts[i].get_position()
+            pos_j = texts[j].get_position()
+            dy = abs(pos_i[1] - pos_j[1])
+            dx = abs(pos_i[0] - pos_j[0])
+            if dy < 0.25 and dx < 0.6:
+                shift = (0.25 - dy) / 2 + 0.05
+                if pos_i[1] >= pos_j[1]:
+                    texts[i].set_position((pos_i[0], pos_i[1] + shift))
+                    texts[j].set_position((pos_j[0], pos_j[1] - shift))
+                else:
+                    texts[i].set_position((pos_i[0], pos_i[1] - shift))
+                    texts[j].set_position((pos_j[0], pos_j[1] + shift))
+
+    # Pull the "Failed" label ~2 cm closer to the pie.
+    # Figure is 10×8 in → 8 in height; data span ≈ 3 units → 2 cm ≈ 0.24 data-units.
+    for txt in texts:
+        if txt.get_text().startswith('Failed'):
+            x0, y0 = txt.get_position()
+            # Move towards centre (sign of y0 tells which hemisphere)
+            shift = 0.24 if y0 < 0 else -0.24
+            txt.set_position((x0, y0 + shift))
+
+    ax.axis('equal')
+    mlbl = MODEL_LABELS.get(model_name, model_name)
+    plt.title(f'{run_name} — {mlbl}\nTotal: {n_tot}',
+              fontsize=13, fontweight='bold', pad=20)
     plt.tight_layout()
-    path = os.path.join(out_dir, f'{run_name}_ch{ch_id:04d}_model_comparison.png')
+    path = os.path.join(out_dir, f'{run_name}_fit_quality_piechart_{model_name}.png')
     fig.savefig(path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     logging.info(f"Saved {path}")
+
+
+# =============================================================================
+# PLOT: Summary distributions (2x4: good row, bad row) — per model
+# =============================================================================
+def _auto_range(vals):
+    """Return (lo, hi) that shows every entry: min*0.9 .. max*1.1."""
+    vmin, vmax = np.min(vals), np.max(vals)
+    lo = vmin * 0.9 if vmin > 0 else vmin - 0.1 * abs(vmax - vmin)
+    hi = vmax * 1.1 if vmax > 0 else vmax + 0.1 * abs(vmax - vmin)
+    if lo == hi:
+        lo, hi = lo - 1, hi + 1
+    return (lo, hi)
+
+
+def _plot_dist_row(axes, fits, row, category, is_good=False):
+    color_main = 'red' if 'Bad' in category else 'green'
+
+    # Col 0: Gain
+    ax = axes[row, 0]
+    vals = [r['gain'] for r in fits if r['gain'] > 0]
+    if vals:
+        mu, std = np.mean(vals), np.std(vals)
+        rng = _auto_range(vals)
+        ax.hist(vals, bins=50, range=rng, color=color_main, alpha=0.7, edgecolor='k')
+        ax.axvline(mu, c='red', ls='--', lw=2)
+        ax.set_yscale('log')
+        ax.text(0.65, 0.97, f'N={len(vals)}\nmu={mu:.1f}\nsigma={std:.1f}',
+                transform=ax.transAxes, va='top', fontsize=8, family='monospace',
+                bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+    ax.set_title(f'{category}: Gain', fontweight='bold', fontsize=10)
+    ax.set_xlabel('Gain (ADC/PE)')
+    ax.grid(True, alpha=0.3)
+
+    # Col 1: Intercept
+    ax = axes[row, 1]
+    vals = [r['intercept'] for r in fits]
+    if vals:
+        mu_i, std_i = np.mean(vals), np.std(vals)
+        rng = _auto_range(vals)
+        ax.hist(vals, bins=50, range=rng, color=color_main, alpha=0.7, edgecolor='k')
+        ax.axvline(mu_i, c='red', ls='--', lw=2)
+        ax.set_yscale('log')
+        ax.text(0.65, 0.97, f'N={len(vals)}\nmu={mu_i:.1f}\nsigma={std_i:.1f}',
+                transform=ax.transAxes, va='top', fontsize=8, family='monospace',
+                bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+    ax.set_title(f'{category}: Intercept', fontweight='bold', fontsize=10)
+    ax.set_xlabel('Intercept (ADC)')
+    ax.grid(True, alpha=0.3)
+
+    # Col 2: chi2/ndf
+    ax = axes[row, 2]
+    vals = [r['chi2_dof'] for r in fits if r['chi2_dof'] > 0]
+    if vals:
+        rng = _auto_range(vals)
+        ax.hist(vals, bins=50, range=rng, color='blue', alpha=0.7, edgecolor='k')
+        ax.set_yscale('log')
+    ax.set_title(f'{category}: chi2/ndf', fontweight='bold', fontsize=10)
+    ax.set_xlabel('chi2/ndf')
+    ax.grid(True, alpha=0.3)
+
+    # Col 3: R2
+    ax = axes[row, 3]
+    vals = [r['linear_r2'] for r in fits if r['linear_r2'] > 0]
+    if vals:
+        rng = _auto_range(vals)
+        if is_good:
+            rng = (0.989, rng[1])
+        ax.hist(vals, bins=50, range=rng, color='purple', alpha=0.7, edgecolor='k')
+        ax.set_yscale('log')
+    ax.set_title(f'{category}: R2', fontweight='bold', fontsize=10)
+    ax.set_xlabel('R2')
+    ax.grid(True, alpha=0.3)
+
+
+def plot_summary(good, bad, model_name, run_name, out_dir):
+    mlbl = MODEL_LABELS.get(model_name, model_name)
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    _plot_dist_row(axes, good, 0, 'Good (>=3 peaks)', is_good=True)
+    _plot_dist_row(axes, bad,  1, 'Bad',               is_good=False)
+    plt.suptitle(f'{run_name} — {mlbl}', fontsize=18, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    path = os.path.join(out_dir, f'{run_name}_summary_plots_{model_name}.png')
+    fig.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    logging.info(f"Saved {path}")
+
+
+# =============================================================================
+# PLOT: Per-channel fit (ADC + residuals) and linear gain — per model
+# =============================================================================
+def plot_channel_fit(row, model_name, plot_dir, quality):
+    """
+    Save two PNGs per (channel, model):
+      plots_RUNXXXX/{quality}/ch{XXXX}_{model}_fit.png
+      plots_RUNXXXX/{quality}/ch{XXXX}_{model}_linear.png
+    """
+    ch_id = row['channel_id']
+    hist  = row['hist']
+    peaks = row['detected_peaks']
+    n_peaks = row['n_peaks']
+
+    title_color = {'good': 'green', 'bad': 'orange', 'failed': 'red'}.get(quality, 'red')
+    mlbl = MODEL_LABELS.get(model_name, model_name)
+    fit_color = MODEL_COLORS.get(model_name, 'steelblue')
+
+    q_dir = os.path.join(plot_dir, quality)
+    os.makedirs(q_dir, exist_ok=True)
+    base = os.path.join(q_dir, f'ch{ch_id:04d}_{model_name}')
+
+    # ── 1) ADC fit + residuals ─────────────────────────────────────────────
+    fig = plt.figure(figsize=(10, 7))
+    gs  = gridspec.GridSpec(2, 1, height_ratios=[3, 1], hspace=0.08)
+    ax     = fig.add_subplot(gs[0])
+    ax_res = fig.add_subplot(gs[1], sharex=ax)
+
+    fig.suptitle(f'Channel {ch_id}  ({mlbl}) — {quality.upper()} Fit',
+                 fontsize=12, color=title_color, fontweight='bold')
+
+    pos_mask  = (BIN_CENTERS > 0) & (hist > 0)
+    y_max_dat = float(np.max(hist[pos_mask])) if np.any(pos_mask) else 1.0
+
+    ax.step(BIN_CENTERS, hist, where='mid', color='black',
+            linewidth=0.6, alpha=0.85, label='Data')
+    ax.set_yscale('log')
+    ax.set_ylim(0.5, y_max_dat * 200)
+    ax.set_ylabel('Counts', fontsize=11)
+    ax.set_xlim(0, BIN_MAX)
+    ax.grid(True, alpha=0.25)
+
+    if row['fit_status'] == 1 and row['fit_params'] is not None:
+        fit_min = row['fit_min']
+        fit_max = row['fit_max']
+        mask = (BIN_CENTERS >= fit_min) & (BIN_CENTERS <= fit_max)
+        x_d = BIN_CENTERS[mask]
+        y_m = model_predict_np(model_name, x_d, row['fit_params'], n_peaks)
+
+        fit_lbl = (
+            f"{mlbl}\n"
+            f"Gain={row['gain']:.0f}+/-{row['gain_error']:.0f} ADC/PE\n"
+            f"chi2/ndf={row['chi2_dof']:.2f}  R2={row['linear_r2']:.3f}"
+        )
+        ax.plot(x_d, y_m, color=fit_color, lw=1.8, label=fit_lbl, zorder=3)
+
+        # Coloured dashed PE-peak lines
+        if model_name == 'multigauss':
+            for i in range(n_peaks):
+                mu_i = row['fit_params'][3*i + 1]
+                sig_i = row['fit_params'][3*i + 2]
+                c_i = PEAK_COLORS[i % len(PEAK_COLORS)]
+                lbl = f'{i+1} PE: mu={mu_i:.0f}, sigma={sig_i:.0f}' if i < 4 else f'{i+1} PE: mu={mu_i:.0f}'
+                ax.axvline(mu_i, color=c_i, linestyle='--', linewidth=1.2, alpha=0.75, label=lbl)
+        else:
+            mu1_f = row['fit_params'][1]
+            gain_f = row['fit_params'][4]
+            sp = row['fit_params'][2]
+            sb = row['fit_params'][3]
+            for i in range(n_peaks):
+                mu_i = mu1_f + i * gain_f
+                sig_i = peak_sigma(i+1, sp, sb)
+                c_i = PEAK_COLORS[i % len(PEAK_COLORS)]
+                lbl = f'{i+1} PE: mu={mu_i:.0f}, sigma={sig_i:.0f}' if i < 4 else f'{i+1} PE: mu={mu_i:.0f}'
+                ax.axvline(mu_i, color=c_i, linestyle='--', linewidth=1.2, alpha=0.75, label=lbl)
+
+        bbox_fc = 'lightgreen' if quality == 'good' else ('lightyellow' if quality == 'bad' else 'lightcoral')
+        extra_lines = ""
+        ex = row.get('extra', {})
+        if 'p_ct_est' in ex:
+            extra_lines += f"p_ct ~ {ex['p_ct_est']:.3f}\n"
+        if 'alpha' in ex:
+            extra_lines += f"alpha = {ex['alpha']:.4f}, Q_ap/G = {ex.get('Q_ap_rel',0):.3f}\n"
+
+        info_text = (
+            f"STATUS: SUCCESS\n"
+            f"Method: {model_name}\n"
+            f"Quality: {quality.upper()}\n"
+            f"{'─'*20}\n"
+            f"Total Events: {int(np.sum(hist))}\n"
+            f"Peaks: {n_peaks}\n"
+            f"{'─'*20}\n"
+            f"chi2/ndf: {row['chi2_dof']:.2f}\n"
+            f"{extra_lines}"
+        )
+        ax.text(0.02, 0.98, info_text, transform=ax.transAxes,
+                va='top', ha='left', fontsize=8, family='monospace',
+                bbox=dict(boxstyle='round', facecolor=bbox_fc, alpha=0.75))
+
+        # Residuals
+        fit_mask = (BIN_CENTERS >= x_d[0]) & (BIN_CENTERS <= x_d[-1])
+        y_dw = hist[fit_mask]
+        if len(y_dw) == len(y_m):
+            res = y_dw - y_m
+            ax_res.bar(x_d, res, width=BIN_WIDTH * 0.9, color=fit_color, alpha=0.55)
+            ax_res.axhline(0, color='k', lw=0.8)
+            ax_res.grid(True, alpha=0.25)
+    else:
+        info_text = (
+            f"STATUS: FAILED\n"
+            f"Method: {model_name}\n"
+            f"Quality: {quality.upper()}\n"
+            f"{'─'*20}\n"
+            f"Total Events: {int(np.sum(hist))}\n"
+            f"Detected Peaks: {len(peaks)}\n"
+        )
+        ax.text(0.02, 0.98, info_text, transform=ax.transAxes,
+                va='top', ha='left', fontsize=8, family='monospace',
+                bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.75))
+        ax.text(0.5, 0.5, 'FIT FAILED', transform=ax.transAxes,
+                ha='center', va='center', color='red', fontsize=16, fontweight='bold')
+
+    ax.legend(fontsize=7, ncol=2, loc='upper right')
+    plt.setp(ax.get_xticklabels(), visible=False)
+    ax_res.set_xlabel('ADC [counts]', fontsize=11)
+    ax_res.set_ylabel('Residual', fontsize=11)
+
+    fig.savefig(base + '_fit.png', dpi=100, bbox_inches='tight')
+    plt.close(fig)
+
+    # ── 2) Linear gain PNG ─────────────────────────────────────────────────
+    if row['fit_status'] == 1 and row['gain'] > 0 and n_peaks >= 2:
+        if model_name == 'multigauss':
+            ns_arr = np.arange(1, n_peaks + 1)
+            mu_arr = np.array([row['fit_params'][3*i + 1] for i in range(n_peaks)])
+        else:
+            mu1_f = row['fit_params'][1]
+            gf = row['fit_params'][4]
+            ns_arr = np.arange(1, n_peaks + 1)
+            mu_arr = np.array([mu1_f + (n-1)*gf for n in ns_arr])
+
+        fig2, ax2 = plt.subplots(figsize=(7, 5))
+        ax2.scatter(ns_arr, mu_arr, color='blue', zorder=3, s=60, label='Fitted Means')
+
+        x_line = np.linspace(0.5, n_peaks + 0.5, 200)
+        y_line = row['intercept'] + row['gain'] * x_line
+        ax2.plot(x_line, y_line, 'r-', lw=2.0,
+                 label=f"mu = {row['intercept']:.0f} + {row['gain']:.0f}*n")
+
+        lin_c2 = row.get('linear_chi2_dof', -1.0)
+        gain_info = (
+            f"mu = {row['intercept']:.0f} + {row['gain']:.0f}*n\n"
+            f"{'─'*20}\n"
+            f"Gain: {row['gain']:.0f} +/- {row['gain_error']:.0f} ADC/PE\n"
+            f"Intercept: {row['intercept']:.0f} +/- {row['intercept_error']:.0f}\n"
+            f"{'─'*20}\n"
+            f"Linear R2: {row['linear_r2']:.3f}\n"
+            f"Linear chi2/dof: {lin_c2:.2f}\n"
+        )
+        ax2.text(0.05, 0.97, gain_info, transform=ax2.transAxes,
+                 va='top', ha='left', fontsize=9, family='monospace',
+                 bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.85))
+
+        ax2.set_xlabel('Peak Number (PE)', fontsize=11)
+        ax2.set_ylabel('ADC Value', fontsize=11)
+        ax2.set_title(f'Channel {ch_id}  {mlbl} — Gain Calculation',
+                       fontsize=11, fontweight='bold')
+        ax2.legend(loc='lower right', fontsize=9)
+        ax2.grid(True, alpha=0.3)
+        plt.tight_layout()
+        fig2.savefig(base + '_linear.png', dpi=100, bbox_inches='tight')
+        plt.close(fig2)
+
+
+# =============================================================================
+# CLASSIFICATION COMPARISON TXT (cross-model)
+# =============================================================================
+def write_comparison_txt(all_results, run_name, out_dir):
+    n_total = len(all_results)
+    path = os.path.join(out_dir, f'{run_name}_classification_comparison.txt')
+
+    with open(path, 'w') as f:
+        f.write(f"{'='*110}\n")
+        f.write(f"CLASSIFICATION COMPARISON — {run_name}\n")
+        f.write(f"Total channels analysed: {n_total}\n")
+        f.write(f"Classification: Method A (chi2/ndf <= {CHI2_MAX}, R2 >= {LINEAR_R2_MIN}, "
+                f"gain in [{EXPECTED_GAIN_MIN}, {EXPECTED_GAIN_MAX}], n_peaks >= 3)\n")
+        f.write(f"{'='*110}\n\n")
+
+        f.write(f"{'Model':<30} {'Good>=3pk':<16} {'Bad':<14} {'Failed':<14}\n")
+        f.write(f"{'-'*110}\n")
+
+        model_splits = {}
+        for mname in MODEL_NAMES:
+            g, b, fl = split_by_model(all_results, mname)
+            model_splits[mname] = (g, b, fl)
+            ng, nb, nf = len(g), len(b), len(fl)
+            pg = 100*ng / n_total if n_total else 0
+            pb = 100*nb / n_total if n_total else 0
+            pf = 100*nf / n_total if n_total else 0
+            mlbl = MODEL_LABELS.get(mname, mname)
+            f.write(f"{mlbl:<30} "
+                    f"{ng:>5} ({pg:>5.1f}%)  "
+                    f"{nb:>5} ({pb:>5.1f}%)  "
+                    f"{nf:>5} ({pf:>5.1f}%)\n")
+
+        f.write(f"\n{'='*110}\n")
+        f.write(f"DETAILED STATISTICS PER MODEL\n")
+        f.write(f"{'='*110}\n")
+
+        for mname in MODEL_NAMES:
+            g, b, fl = model_splits[mname]
+            mlbl = MODEL_LABELS.get(mname, mname)
+            f.write(f"\n{'─'*110}\n")
+            f.write(f"{mlbl}\n")
+            f.write(f"{'─'*110}\n")
+
+            for cat_name, cat_list in [('GOOD FITS (>=3 peaks)', g),
+                                        ('BAD FITS', b)]:
+                f.write(f"\n  {cat_name} ({len(cat_list)} channels):\n")
+                if not cat_list:
+                    f.write(f"    (none)\n")
+                    continue
+
+                if 'BAD' in cat_name:
+                    n_nz = sum(1 for r in cat_list if np.sum(r['hist']) > 0)
+                    n_z  = len(cat_list) - n_nz
+                    f.write(f"    Histogram entries:      non-zero = {n_nz},  zero (empty) = {n_z}\n")
+
+                gains      = [r['gain']       for r in cat_list if r['gain'] > 0]
+                intercepts = [r['intercept']  for r in cat_list]
+                chi2s      = [r['chi2_dof']   for r in cat_list if r['chi2_dof'] > 0]
+                r2s        = [r['linear_r2']  for r in cat_list if r['linear_r2'] > 0]
+
+                for dist_name, vals in [('Gain (ADC/PE)', gains),
+                                         ('Intercept (ADC)', intercepts),
+                                         ('chi2/ndf', chi2s),
+                                         ('R2', r2s)]:
+                    s = dist_stats(vals)
+                    f.write(f"    {dist_name:<25} N={s['n']:>5}  "
+                            f"min={s['min']:>10.3f}  max={s['max']:>10.3f}  "
+                            f"mean={s['mean']:>10.3f}  RMS={s['rms']:>10.3f}\n")
+
+            f.write(f"\n  FAILED FITS ({len(fl)} channels):\n")
+            if fl:
+                n_nz = sum(1 for r in fl if np.sum(r['hist']) > 0)
+                n_z  = len(fl) - n_nz
+                f.write(f"    Histogram entries:      non-zero = {n_nz},  zero (empty) = {n_z}\n")
+            else:
+                f.write(f"    (none)\n")
+
+        f.write(f"\n{'='*110}\n")
+        f.write("PHYSICS NOTES\n")
+        f.write(f"{'='*110}\n")
+        f.write("EMG (Exponential Modified Gaussian):\n")
+        f.write("  f(x) = A/(2t) exp[(mu-x)/t + s^2/(2t^2)] * erfc[s/(t*sqrt2) - (x-mu)/(s*sqrt2)]\n")
+        f.write("  tau/Gain ~ p_ct (optical crosstalk probability)\n")
+        f.write("  Ref: arXiv:1409.4564, Kowalski & Bhatt (EMG)\n\n")
+        f.write("Multi-Gauss + Afterpulse (SYSU geometric model):\n")
+        f.write("  f_n = A_n * Sum_{i=0}^{N_ap} (1-n*alpha)*(n*alpha)^i * G(mu_n + i*Q_ap, sigma_n)\n")
+        f.write("  alpha = afterpulse probability per fired cell\n")
+        f.write("  Q_ap = charge deposited by single AP avalanche\n")
+        f.write("  Ref: Ziang Li, TAO group JAN 2026\n\n")
+        f.write("Note: Generalized Poisson model NOT used — external CT dominates\n")
+        f.write("      at TAO with Ge-68 source, making GP priors unreliable\n")
+        f.write("      (Ziang Li backup slide 24).\n")
+        f.write(f"{'='*110}\n")
+
+    logging.info(f"Saved comparison: {path}")
+
 
 # =============================================================================
 # MAIN
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description='Experimental multi-model gain calibration (ROOT, first N channels)')
-    parser.add_argument('input_root', help='Input ROOT file')
+        description='Experimental multi-model gain calibration (ROOT, all channels).\n'
+                    'Fit models: multigauss, EMG, multigauss_ap.\n'
+                    'Classification: Method A only.\n'
+                    'Plots: good=sample100, bad=all, failed=non-zero only.')
+    parser.add_argument('input_root', help='Input ROOT file with ADC histograms')
     parser.add_argument('output_dir', help='Output directory')
-    parser.add_argument('run_name',   help='Run name')
-    parser.add_argument('--use-raw', action='store_true')
-    parser.add_argument('--n-channels', type=int, default=3,
-                        help='Number of channels to process (default: 3)')
+    parser.add_argument('run_name',   help='Run name (e.g. RUN1295)')
+    parser.add_argument('--use-raw', action='store_true',
+                        help='Use raw (H_adcraw_*) instead of clean (H_adcClean_*)')
+    parser.add_argument('--no-plots', action='store_true',
+                        help='Skip per-channel fit plot generation')
     args = parser.parse_args()
 
     if not os.path.exists(args.input_root):
-        logging.error(f"Not found: {args.input_root}"); sys.exit(1)
-    os.makedirs(args.output_dir, exist_ok=True)
+        logging.error(f"Input file not found: {args.input_root}")
+        sys.exit(1)
 
-    # Load histograms
+    os.makedirs(args.output_dir, exist_ok=True)
+    plot_dir = os.path.join(args.output_dir, f"plots_{args.run_name}")
+    os.makedirs(plot_dir, exist_ok=True)
+    for sub in ['good', 'bad', 'failed']:
+        os.makedirs(os.path.join(plot_dir, sub), exist_ok=True)
+
+    # ── Load histograms ─────────────────────────────────────────────────────
+    logging.info(f"Loading histograms from {args.input_root} ...")
     prefix = "H_adcraw_" if args.use_raw else "H_adcClean_"
+
     f = ROOT.TFile.Open(args.input_root, "READ")
     if not f or f.IsZombie():
-        logging.error("Cannot open file"); sys.exit(1)
+        logging.error("Cannot open ROOT file"); sys.exit(1)
 
     channel_ids = []
     for key in f.GetListOfKeys():
@@ -707,11 +1243,12 @@ def main():
                 continue
     channel_ids.sort()
 
-    n_proc = min(args.n_channels, len(channel_ids))
-    logging.info(f"Found {len(channel_ids)} channels, processing first {n_proc}")
-    channel_ids = channel_ids[:n_proc]
+    if not channel_ids:
+        logging.error("No ADC histograms found!"); f.Close(); sys.exit(1)
 
-    channels = {}
+    logging.info(f"Found {len(channel_ids)} channels")
+
+    channel_data = []
     for ch in channel_ids:
         h = f.Get(f"{prefix}{ch}")
         if h:
@@ -720,120 +1257,61 @@ def main():
                 bidx = h.FindBin(bc)
                 if 1 <= bidx <= h.GetNbinsX():
                     arr[i] = h.GetBinContent(bidx)
-            channels[ch] = arr
+            channel_data.append((ch, arr))
+        else:
+            channel_data.append((ch, np.zeros(N_BINS)))
     f.Close()
 
-    # Process each channel
-    summary_lines = []
-    summary_lines.append(f"{'='*120}")
-    summary_lines.append(f"EXPERIMENTAL FIT COMPARISON — {args.run_name} — {n_proc} channels")
-    summary_lines.append(f"{'='*120}")
-    summary_lines.append("")
-    summary_lines.append(f"{'Channel':<10} {'Model':<18} {'χ²/ndf(ROOT)':<16} {'χ²/ndf(Poisson)':<18} "
-                         f"{'Gain':<12} {'R²':<10} {'Extra':<30}")
-    summary_lines.append("-" * 120)
+    # ── Fit all channels (multiprocessing) ──────────────────────────────────
+    n_workers = min(8, max(1, cpu_count() - 1))
+    logging.info(f"Fitting {len(channel_data)} channels x 3 models ({n_workers} workers) ...")
 
-    for ch_id, hist_data in channels.items():
+    with Pool(n_workers) as pool:
+        all_results = list(tqdm(pool.imap(_worker, channel_data),
+                                total=len(channel_data), desc="Fitting"))
+
+    # ── Per-model: classify -> CSV/TXT -> pie chart -> summary plots ────────
+    for mname in MODEL_NAMES:
         logging.info(f"\n{'='*60}")
-        logging.info(f"Channel {ch_id}")
+        logging.info(f"Model: {MODEL_LABELS[mname]}")
+        good, bad, failed = split_by_model(all_results, mname)
+        ng, nb, nf = len(good), len(bad), len(failed)
+        logging.info(f"  Good (>=3 peaks): {ng}   Bad: {nb}   Failed: {nf}")
 
-        if np.sum(hist_data) < 1000:
-            logging.warning(f"  Too few counts ({np.sum(hist_data):.0f}), skipping")
-            continue
+        save_results_csv_txt(good,   os.path.join(args.output_dir, f'{args.run_name}_{mname}_good'))
+        save_results_csv_txt(bad,    os.path.join(args.output_dir, f'{args.run_name}_{mname}_bad'))
+        save_results_csv_txt(failed, os.path.join(args.output_dir, f'{args.run_name}_{mname}_failed'))
 
-        # Peak detection
-        peaks = detect_peaks_tspectrum(hist_data)
-        if len(peaks) < 2:
-            logging.warning(f"  Only {len(peaks)} peaks found, skipping")
-            continue
+        plot_piechart(good, bad, failed, mname, args.run_name, args.output_dir)
+        plot_summary(good, bad, mname, args.run_name, args.output_dir)
 
-        est_gain = estimate_gain_from_peaks(peaks)
-        logging.info(f"  Detected {len(peaks)} peaks, est. gain = {est_gain:.0f} ADC/PE")
+    # ── Comparison TXT ──────────────────────────────────────────────────────
+    write_comparison_txt(all_results, args.run_name, args.output_dir)
 
-        fit_results = {}
+    # ── Per-channel fit plots (per model, same sampling as stable) ──────────
+    if not args.no_plots:
+        logging.info(f"\nGenerating per-channel fit plots ...")
+        for mname in MODEL_NAMES:
+            good, bad, failed = split_by_model(all_results, mname)
 
-        # Model 1: multigauss
-        logging.info(f"  Fitting: multigauss ...")
-        r1 = fit_multigauss_root(ch_id, hist_data, peaks, est_gain)
-        fit_results['multigauss'] = r1
-        if r1:
-            lin = linear_fit_gain(len(peaks), r1['params'], 'multigauss')
-            g_val = lin['gain'] if lin else 0
-            r2_val = lin['r2'] if lin else 0
-            logging.info(f"    ROOT χ²/ndf = {r1['chi2_ndf_root']:.3f}, "
-                         f"Poisson χ²/ndf = {r1['chi2_ndf_manual']:.3f}")
-            summary_lines.append(
-                f"{ch_id:<10} {'multigauss':<18} {r1['chi2_ndf_root']:<16.3f} "
-                f"{r1['chi2_ndf_manual']:<18.3f} {g_val:<12.1f} {r2_val:<10.4f} {'—':<30}")
-            mg_seed = r1['params']
-        else:
-            logging.warning(f"    multigauss FAILED")
-            summary_lines.append(f"{ch_id:<10} {'multigauss':<18} {'FAILED':<16}")
-            mg_seed = None
+            good_sample = random.sample(good, min(100, len(good))) if good else []
+            logging.info(f"  {MODEL_LABELS[mname]}:  Good {len(good_sample)}/{len(good)} (sampled), "
+                         f"Bad {len(bad)} (all)")
 
-        # Model 2: EMG
-        logging.info(f"  Fitting: EMG ...")
-        r2 = fit_emg_root(ch_id, hist_data, peaks, est_gain, mg_seed)
-        fit_results['emg'] = r2
-        if r2:
-            lin = linear_fit_gain(len(peaks), r2['params'], 'emg')
-            g_val = lin['gain'] if lin else r2['params'][4]
-            r2_val = lin['r2'] if lin else 0
-            extra = f"τ={r2['extra']['tau']:.1f}, p_ct≈{r2['extra']['p_ct_est']:.3f}"
-            logging.info(f"    ROOT χ²/ndf = {r2['chi2_ndf_root']:.3f}, {extra}")
-            summary_lines.append(
-                f"{ch_id:<10} {'emg':<18} {r2['chi2_ndf_root']:<16.3f} "
-                f"{r2['chi2_ndf_manual']:<18.3f} {g_val:<12.1f} {r2_val:<10.4f} {extra:<30}")
-        else:
-            logging.warning(f"    EMG FAILED")
-            summary_lines.append(f"{ch_id:<10} {'emg':<18} {'FAILED':<16}")
+            failed_nonzero = [r for r in failed if np.sum(r['hist']) > 0]
+            failed_zero    = [r for r in failed if np.sum(r['hist']) == 0]
+            logging.info(f"    Failed {len(failed_nonzero)}/{len(failed)} "
+                         f"(non-zero; {len(failed_zero)} empty)")
 
-        # Model 3: multigauss + afterpulse
-        logging.info(f"  Fitting: multigauss_ap ...")
-        r3 = fit_multigauss_ap_root(ch_id, hist_data, peaks, est_gain, mg_seed)
-        fit_results['multigauss_ap'] = r3
-        if r3:
-            lin = linear_fit_gain(len(peaks), r3['params'], 'multigauss_ap')
-            g_val = lin['gain'] if lin else r3['params'][4]
-            r2_val = lin['r2'] if lin else 0
-            extra = f"α={r3['extra']['alpha']:.4f}, Q_ap/G={r3['extra']['Q_ap_rel']:.3f}"
-            logging.info(f"    ROOT χ²/ndf = {r3['chi2_ndf_root']:.3f}, {extra}")
-            summary_lines.append(
-                f"{ch_id:<10} {'multigauss_ap':<18} {r3['chi2_ndf_root']:<16.3f} "
-                f"{r3['chi2_ndf_manual']:<18.3f} {g_val:<12.1f} {r2_val:<10.4f} {extra:<30}")
-        else:
-            logging.warning(f"    multigauss_ap FAILED")
-            summary_lines.append(f"{ch_id:<10} {'multigauss_ap':<18} {'FAILED':<16}")
+            for r in tqdm(good_sample, desc=f"  {mname} good (sample)"):
+                plot_channel_fit(r, mname, plot_dir, 'good')
+            for r in tqdm(bad, desc=f"  {mname} bad (all)"):
+                plot_channel_fit(r, mname, plot_dir, 'bad')
+            for r in tqdm(failed_nonzero, desc=f"  {mname} failed (non-zero)"):
+                plot_channel_fit(r, mname, plot_dir, 'failed')
 
-        # Plot comparison
-        plot_channel_comparison(ch_id, hist_data, peaks, fit_results, args.output_dir, args.run_name)
+    logging.info(f"\nDone! Results in {args.output_dir}")
 
-    # Write summary TXT
-    summary_lines.append("")
-    summary_lines.append("=" * 120)
-    summary_lines.append("PHYSICS NOTES")
-    summary_lines.append("=" * 120)
-    summary_lines.append("EMG (Exponential Modified Gaussian):")
-    summary_lines.append("  f(x) = A/(2τ) exp[(μ-x)/τ + σ²/(2τ²)] · erfc[σ/(τ√2) - (x-μ)/(σ√2)]")
-    summary_lines.append("  τ/Gain ≈ p_ct (optical crosstalk probability)")
-    summary_lines.append("  Ref: arXiv:1409.4564, Kowalski & Bhatt (EMG)")
-    summary_lines.append("")
-    summary_lines.append("Multi-Gauss + Afterpulse (SYSU geometric model):")
-    summary_lines.append("  f_n = A_n · Σ_{i=0}^{N_ap} (1-nα)(nα)^i · G(μ_n + i·Q_ap, σ_n)")
-    summary_lines.append("  α = afterpulse probability per fired cell")
-    summary_lines.append("  Q_ap = charge deposited by single AP avalanche")
-    summary_lines.append("  Ref: Ziang Li, TAO group JAN 2026")
-    summary_lines.append("")
-    summary_lines.append("Note: Generalized Poisson model NOT used — external CT dominates")
-    summary_lines.append("      at TAO with Ge-68 source, making GP priors unreliable")
-    summary_lines.append("      (Ziang Li backup slide 24).")
-    summary_lines.append("=" * 120)
-
-    txt_path = os.path.join(args.output_dir, f'{args.run_name}_experimental_comparison.txt')
-    with open(txt_path, 'w') as tf:
-        tf.write("\n".join(summary_lines) + "\n")
-    logging.info(f"\nSaved summary: {txt_path}")
-    logging.info(f"Done! Results in {args.output_dir}")
 
 if __name__ == "__main__":
     main()
