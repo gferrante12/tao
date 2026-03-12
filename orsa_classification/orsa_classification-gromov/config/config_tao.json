@@ -1,0 +1,207 @@
+{
+    "Categories": {
+        "WT_Muon_Raw": {
+            "name": "WT_Muon_Raw",
+            "cuts": {
+                "detector": "WT",
+                "nfired_min": 11.0
+            }
+        },
+        "TVT_Muon_Raw": {
+            "name": "TVT_Muon_Raw",
+            "cuts": {
+                "detector": "TVT",
+                "nfecs_min": 3.0
+            }
+        },
+        "CDMuon_Candidate": {
+            "name": "CDMuon_Candidate",
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 20.0
+            }
+        },
+        "HardMuon_Raw": {
+            "name": "HardMuon_Raw",
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 800.0
+            }
+        },
+        "Spallation_Follower_Candidate": {
+            "name": "Spallation_Follower_Candidate",
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 6.0,
+                "energy_max": 20.0
+            }
+        },
+        "IBD_Prompt_Base": {
+            "name": "IBD_Prompt_Base",
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 0.9,
+                "energy_max": 12.0,
+                "radius_max": 880.0
+            }
+        },
+        "IBD_Prompt_FV": {
+            "name": "IBD_Prompt_FV",
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 0.9,
+                "energy_max": 12.0,
+                "radius_max": 650.0
+            }
+        },
+        "IBD_Delayed_Base": {
+            "name": "IBD_Delayed_Base",
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 7.0,
+                "energy_max": 9.0,
+                "radius_max": 880.0
+            }
+        },
+        "Isolation_Tag": {
+            "name": "Isolation_Tag",
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 0.9,
+                "energy_max": 12.0
+            }
+        }
+    },
+    "Rules": [
+        {
+            "name": "Identify_OuterMuon_Raw",
+            "type": "Compound",
+            "operation": "OR",
+            "children": [
+                "WT_Muon_Raw",
+                "TVT_Muon_Raw"
+            ],
+            "result_tag": "OuterMuon_Raw"
+        },
+        {
+            "name": "OuterMuon_CD_Check",
+            "type": "Coincidence",
+            "tag_1": "OuterMuon_Raw",
+            "tag_2": "CDMuon_Candidate",
+            "window": 1400.0,
+            "new_tag": "Is_Overlap_Muon"
+        },
+        {
+            "name": "Identify_OuterMuon",
+            "type": "Category",
+            "category": "OuterMuon_Raw",
+            "requires_tag": "Is_Overlap_Muon",
+            "requires_tag_negate": true,
+            "new_tag": "OuterMuon"
+        },
+        {
+            "name": "Identify_CDMuon",
+            "type": "Category",
+            "category": "CDMuon_Candidate",
+            "requires_tag": "HardMuon_Raw",
+            "requires_tag_negate": true,
+            "new_tag": "Muon_CD"
+        },
+        {
+            "name": "Identify_Hard_Spallation",
+            "type": "Category",
+            "category": "HardMuon_Raw",
+            "new_tag": "SpallationMuon"
+        },
+        {
+            "name": "Identify_Follower_Spallation",
+            "type": "MuonNeutron",
+            "muon_tag": "OuterMuon",
+            "neutron_tag": "Spallation_Follower_Candidate",
+            "dt_max": 20000.0,
+            "result_tag": "SpallationMuon"
+        },
+        {
+            "name": "Veto_Outer",
+            "type": "MuonVeto",
+            "muon_tag": "OuterMuon",
+            "veto_time": 20000.0,
+            "veto_tag": "MuonVetoed"
+        },
+        {
+            "name": "Veto_CD",
+            "type": "MuonVeto",
+            "muon_tag": "Muon_CD",
+            "veto_time": 100000.0,
+            "veto_tag": "MuonVetoed"
+        },
+        {
+            "name": "Veto_Spallation",
+            "type": "MuonVeto",
+            "muon_tag": "SpallationMuon",
+            "veto_time": 200000.0,
+            "veto_tag": "MuonVetoed"
+        },
+        {
+            "name": "IBD_Selection_All",
+            "type": "Pair",
+            "prompt": "IBD_Prompt_Base",
+            "delayed": "IBD_Delayed_Base",
+            "dt_min": 2500.0,
+            "dt_max": 100000.0,
+            "dr_max": 1800.0,
+            "isolation": {
+                "tag": "Isolation_Tag",
+                "window_before": 100000.0,
+                "window_between": 100000.0,
+                "window_after": 100000.0
+            },
+            "result_tag": "IBD_Candidate",
+            "acc_n_windows": 10,
+            "acc_window_shift": 500000000.0,
+            "output": {
+                "path": "output/IBDSignal_all"
+            }
+        },
+        {
+            "name": "IBD_Selection_Clean",
+            "type": "Pair",
+            "prompt": "IBD_Prompt_Base",
+            "delayed": "IBD_Delayed_Base",
+            "dt_min": 2500.0,
+            "dt_max": 100000.0,
+            "dr_max": 1800.0,
+            "isolation": {
+                "tag": "Isolation_Tag",
+                "window_before": 100000.0,
+                "window_between": 100000.0,
+                "window_after": 100000.0,
+                "iso_before_max": 0,
+                "iso_between_max": 0,
+                "iso_after_max": 0
+            },
+            "requires_tag": "MuonVetoed",
+            "requires_tag_negate": true,
+            "result_tag": "IBD_Candidate",
+            "acc_n_windows": 10,
+            "acc_window_shift": 500000000.0,
+            "output": {
+                "path": "output/IBDSignal_Clean"
+            }
+        },
+        {
+            "type": "TimeWindowPicker",
+            "name": "PickerIBD",
+            "timestamps": [
+                "1768168722330754112",
+                "1768200980830049120",
+                "1768360154349521360"
+            ],
+            "window_before": 2000000000.0,
+            "window_after": 2000000000.0,
+            "output": {
+                "path": "output/PickedEventsIBD"
+            }
+        }
+    ]
+}

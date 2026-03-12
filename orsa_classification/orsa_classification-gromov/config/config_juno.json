@@ -1,0 +1,380 @@
+{
+    "Categories": {
+        "IBD_Prompt": {
+            "cuts": {
+                "energy_min": 0.7,
+                "energy_max": 12.0,
+                "detector": "CD",
+                "radius_max": 16500.0
+            },
+            "logic": {
+                "type": "AND",
+                "children": [
+                    {
+                        "type": "Range",
+                        "var": "detector",
+                        "min": 0.9,
+                        "max": 1.1
+                    },
+                    {
+                        "type": "Range",
+                        "var": "energy",
+                        "min": 0.7,
+                        "max": 12.0
+                    },
+                    {
+                        "type": "Range",
+                        "var": "radius",
+                        "max": 16500.0
+                    },
+                    {
+                        "type": "NOT",
+                        "child": {
+                            "type": "AND",
+                            "children": [
+                                {
+                                    "type": "Range",
+                                    "var": "z",
+                                    "source": "Rec",
+                                    "min": 15500.0
+                                },
+                                {
+                                    "type": "Range",
+                                    "var": "rho",
+                                    "source": "Rec",
+                                    "max": 2000.0
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "type": "NOT",
+                        "child": {
+                            "type": "AND",
+                            "children": [
+                                {
+                                    "type": "Range",
+                                    "var": "z",
+                                    "source": "Rec",
+                                    "max": -15500.0
+                                },
+                                {
+                                    "type": "Range",
+                                    "var": "rho",
+                                    "source": "Rec",
+                                    "max": 2000.0
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "IBD_Delayed": {
+            "cuts": {
+                "energy_min": 2.0,
+                "energy_max": 2.5,
+                "detector": "CD",
+                "radius_max": 16500.0
+            },
+            "logic": {
+                "type": "AND",
+                "children": [
+                    {
+                        "type": "Range",
+                        "var": "detector",
+                        "min": 0.9,
+                        "max": 1.1
+                    },
+                    {
+                        "type": "Range",
+                        "var": "energy",
+                        "min": 2.0,
+                        "max": 2.5
+                    },
+                    {
+                        "type": "Range",
+                        "var": "radius",
+                        "max": 16500.0
+                    },
+                    {
+                        "type": "NOT",
+                        "child": {
+                            "type": "AND",
+                            "children": [
+                                {
+                                    "type": "Range",
+                                    "var": "z",
+                                    "source": "Rec",
+                                    "min": 15500.0
+                                },
+                                {
+                                    "type": "Range",
+                                    "var": "rho",
+                                    "source": "Rec",
+                                    "max": 2000.0
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "type": "NOT",
+                        "child": {
+                            "type": "AND",
+                            "children": [
+                                {
+                                    "type": "Range",
+                                    "var": "z",
+                                    "source": "Rec",
+                                    "max": -15500.0
+                                },
+                                {
+                                    "type": "Range",
+                                    "var": "rho",
+                                    "source": "Rec",
+                                    "max": 2000.0
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "Spallation_Neutron_Candidate": {
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 1.5,
+                "energy_max": 20.0,
+                "hit_t_std_max": 275.0
+            }
+        },
+        "BiPo_Prompt": {
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 0.9,
+                "energy_max": 3.5
+            }
+        },
+        "BiPo_Delayed": {
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 0.6,
+                "energy_max": 1.5
+            }
+        },
+        "C11_Candidate": {
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 0.8,
+                "energy_max": 2.0
+            }
+        },
+        "B12_Candidate": {
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 3.0,
+                "energy_max": 14.0
+            }
+        },
+        "Muon_CD_HighQ": {
+            "cuts": {
+                "detector": "CD",
+                "charge_min": 30000.0
+            }
+        },
+        "Muon_WP_HighQ": {
+            "cuts": {
+                "detector": "WP",
+                "charge_min": 700.0
+            }
+        },
+        "Muon_WP_LowQ": {
+            "cuts": {
+                "detector": "WP",
+                "charge_min": 400.0
+            }
+        },
+        "Multiplicity_Candidate": {
+            "cuts": {
+                "detector": "CD",
+                "energy_min": 2.0,
+                "energy_max": 12.0
+            }
+        }
+    },
+    "Rules": [
+        {
+            "type": "DataQuality",
+            "name": "DQ_Veto",
+            "wp_gap_threshold": 7.0e7,
+            "cd_gap_threshold": 5.0e7,
+            "gap_dead_time": 5.0e6,
+            "job_start_veto": true
+        },
+        {
+            "type": "Coincidence",
+            "name": "Muon_CDWP_Coinc",
+            "tag_1": "Muon_CD_HighQ",
+            "tag_2": "Muon_WP_LowQ",
+            "window": 500.0,
+            "new_tag": "Muon_CDWP"
+        },
+        {
+            "type": "Compound",
+            "name": "Muon_WP_Only_Rule",
+            "operation": "AND",
+            "children": [
+                "Muon_WP_HighQ",
+                {
+                    "type": "Category",
+                    "category": "Muon_CDWP",
+                    "requires_tag_negate": true
+                }
+            ],
+            "result_tag": "Muon_Strict"
+        },
+        {
+            "type": "Compound",
+            "name": "Muon_CD_Only_Rule",
+            "operation": "AND",
+            "children": [
+                "Muon_CD_HighQ",
+                {
+                    "type": "Category",
+                    "category": "Muon_CDWP",
+                    "requires_tag_negate": true
+                }
+            ],
+            "result_tag": "Muon_Strict"
+        },
+        {
+            "type": "Category",
+            "name": "Muon_CDWP_Promote",
+            "category": "Muon_CDWP",
+            "new_tag": "Muon_Strict"
+        },
+        {
+            "type": "Spallation",
+            "name": "Spallation_Neutron_Tagging",
+            "time_window": 2000000.0,
+            "radius": 200000.0,
+            "target_tag": "Spallation_Neutron_Candidate",
+            "new_tag": "SpallationNeutron"
+        },
+        {
+            "type": "MuonVeto",
+            "name": "General_Muon_Veto",
+            "veto_time": 5000000.0,
+            "muon_tag": "Muon_Strict",
+            "veto_tag": "MuonVetoed"
+        },
+        {
+            "type": "SpatialVeto",
+            "name": "Spatial_Neutron_Veto",
+            "time_window": 1200000000.0,
+            "radius": 4000.0,
+            "target_tag": "SpallationNeutron",
+            "veto_tag": "NeutronVetoed"
+        },
+        {
+            "type": "SpatialVeto",
+            "name": "Muon_Track_Veto",
+            "time_window": 1200000000.0,
+            "radius": 3000.0,
+            "target_tag": "Muon_Strict",
+            "veto_tag": "TrackVetoed"
+        },
+        {
+            "type": "Compound",
+            "name": "Global_Veto_Consolidator",
+            "operation": "OR",
+            "children": [
+                {
+                    "type": "Category",
+                    "category": "MuonVetoed"
+                },
+                {
+                    "type": "Category",
+                    "category": "NeutronVetoed"
+                },
+                {
+                    "type": "Category",
+                    "category": "TrackVetoed"
+                },
+                {
+                    "type": "Category",
+                    "category": "DataQualityVetoed"
+                }
+            ],
+            "result_tag": "AnyVetoed"
+        },
+        {
+            "type": "Pair",
+            "name": "IM_IBD_Candidates",
+            "prompt": "IBD_Prompt",
+            "delayed": "IBD_Delayed",
+            "dt_min": 5000,
+            "dt_max": 1000000,
+            "dr_max": 1500.0,
+            "requires_tag": "AnyVetoed",
+            "requires_tag_negate": true,
+            "isolation": {
+                "tag": "Multiplicity_Candidate",
+                "window_before": 1000000,
+                "window_after": 1000000,
+                "iso_before_max": 0,
+                "iso_between_max": 0,
+                "iso_after_max": 0
+            },
+            "acc_n_windows": 100,
+            "acc_window_shift": 2000000.0,
+            "output": {
+                "path": "output/IBD_Events",
+                "save_muon_info": true,
+                "save_calib_info": true
+            }
+        },
+        {
+            "type": "Pair",
+            "name": "BiPo214_Selection",
+            "prompt": "BiPo_Prompt",
+            "delayed": "BiPo_Delayed",
+            "dt_min": 1000,
+            "dt_max": 1000000,
+            "dr_max": 1000.0,
+            "requires_tag": "AnyVetoed",
+            "requires_tag_negate": true,
+            "output": {
+                "path": "output/BiPo214_Events"
+            }
+        },
+        {
+            "type": "LongHistory",
+            "name": "B12_Selection",
+            "candidate_tag": "B12_Candidate",
+            "history_tag": "Muon_Strict",
+            "min_window": 5000000,
+            "max_window": 100000000,
+            "radius": 5000.0,
+            "result_tag": "B12_Tagged",
+            "output": {
+                "path": "output/B12_Events",
+                "save_muon_info": true
+            }
+        },
+        {
+            "type": "LongHistory",
+            "name": "C11_Selection",
+            "candidate_tag": "C11_Candidate",
+            "history_tag": "SpallationNeutron",
+            "min_window": 1000000.0,
+            "max_window": 1800000000000.0,
+            "radius": 3000.0,
+            "result_tag": "C11_Tagged",
+            "output": {
+                "path": "output/C11_Events",
+                "save_muon_info": true
+            }
+        }
+    ]
+}
