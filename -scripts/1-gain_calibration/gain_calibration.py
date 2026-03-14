@@ -14,8 +14,8 @@ Options
   --use-raw          Use raw (non-vetoed) histograms [default: clean]
   --plots {none,sample,all}
                      none   : skip per-channel plots
-                     sample : 50 random per category [default]
-                     all    : every channel
+                     sample : 50 random per category
+                     all    : every channel [default]
   --models M1,M2,…  Comma-separated model list [default: all]
                      Choices: multigauss multigauss_ct multigauss_ap emg emg_ap
   --n-peaks INT      Force fixed number of PE peaks [default: auto 2–8]
@@ -29,8 +29,9 @@ Options
 Output (inside output_dir/)
   {run}_{model}_good.csv / bad.csv / failed.csv     (one set per model)
   {run}_{model}_good.txt / bad.txt / failed.txt     (formatted text tables)
-  plots/good/{model}/ch_XXXXX_fit.png               (ADC + residuals)
-  plots/good/{model}/ch_XXXXX_linear.png            (gain extraction)
+  {run}_good_channels_features.txt                  (per-channel feature table)
+  plots/good/{model}/ch_XXXXX_fit.png
+  plots/good/{model}/ch_XXXXX_linear.png
   plots/overview/{run}_{model}_overview.png
   summary_{run}.txt
 
@@ -81,17 +82,17 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 # ── Default thresholds ────────────────────────────────────────────────────────
-CHI2_MAX     = 100.0    # maximum χ²/ndf for "good"
-R2_MIN       = 0.90     # minimum linear R² for "good"
+CHI2_MAX     = 100.0
+R2_MIN       = 0.90
 GAIN_MIN_DEF = 3_200
 GAIN_MAX_DEF = 8_500
 GAIN_DEFAULT = 6_000
 MIN_ENTRIES  = 2_000
-SAMPLE_N     = 50       # plots per category when --plots sample
+SAMPLE_N     = 50
 
 
 # =============================================================================
-# PEAK DETECTION  (no TSpectrum / scipy)
+# PEAK DETECTION
 # =============================================================================
 
 def _gauss_kernel(half_width, sigma_bins):
@@ -101,7 +102,6 @@ def _gauss_kernel(half_width, sigma_bins):
 
 
 def smooth_hist(hist, sigma_bins=3.0):
-    """Gaussian kernel smoothing with edge padding."""
     hw     = max(1, int(3.5 * sigma_bins))
     kernel = _gauss_kernel(hw, sigma_bins)
     padded = np.pad(hist.astype(float), hw, mode='edge')
@@ -109,7 +109,6 @@ def smooth_hist(hist, sigma_bins=3.0):
 
 
 def local_maxima(arr, min_dist):
-    """Local maxima separated by at least min_dist bins."""
     cands = [i for i in range(1, len(arr) - 1)
              if arr[i] > arr[i - 1] and arr[i] > arr[i + 1]]
     if not cands:
@@ -124,18 +123,6 @@ def local_maxima(arr, min_dist):
 
 
 def detect_peaks(hist, gain_est=GAIN_DEFAULT):
-    """
-    Detect PE peaks in ADC histogram without TSpectrum.
-
-    Algorithm
-    ---------
-    1. Gaussian smooth (σ ≈ gain/10 bins).
-    2. Find all local maxima with minimum separation = 0.5·gain.
-    3. Prominence filter: height above surrounding minimum > 0.5% of max.
-    4. Keep only peaks whose spacing from the previous peak lies in [0.5g, 1.5g].
-    5. Enforce roughly decreasing heights (20% tolerance).
-    6. Return up to 8 peaks.
-    """
     if np.sum(hist) < MIN_ENTRIES:
         return []
 
@@ -146,7 +133,6 @@ def detect_peaks(hist, gain_est=GAIN_DEFAULT):
     if len(idxs) < 2:
         return []
 
-    # Prominence filter
     win   = max(2, int(2.0 * gain_est / BIN_WIDTH))
     proms = []
     for i in idxs:
@@ -161,7 +147,6 @@ def detect_peaks(hist, gain_est=GAIN_DEFAULT):
 
     peaks = sorted(float(BIN_CTRS[i]) for i in idxs)
 
-    # First-peak candidates
     cands = ([p for p in peaks if gain_est / 3 <= p <= gain_est * 3]
              or [p for p in peaks if 300 <= p <= 25_000])
     if not cands:
@@ -169,7 +154,6 @@ def detect_peaks(hist, gain_est=GAIN_DEFAULT):
     h0 = [hist[int(np.argmin(np.abs(BIN_CTRS - p)))] for p in cands]
     fp = cands[int(np.argmax(h0))]
 
-    # Build chain with spacing check
     chain = [fp]
     for p in peaks:
         if p <= fp:
@@ -180,7 +164,6 @@ def detect_peaks(hist, gain_est=GAIN_DEFAULT):
         if len(chain) >= 8:
             break
 
-    # Monotone-decreasing heights (20% tolerance)
     heights = [hist[int(np.argmin(np.abs(BIN_CTRS - p)))] for p in chain]
     cut = len(chain)
     for i in range(len(heights) - 1):
@@ -196,15 +179,9 @@ def detect_peaks(hist, gain_est=GAIN_DEFAULT):
 # =============================================================================
 
 def load_histograms(root_file, use_raw=False):
-    """
-    Read per-channel ADC histograms from a ROOT file.
-    Tries uproot first, falls back to PyROOT.
-    Returns {channel_id: hist_array(N_BINS)}.
-    """
     prefix = 'H_adc' + ('raw' if use_raw else 'Clean') + '_'
     histograms = {}
 
-    # ── uproot ──────────────────────────────────────────────────────────────
     try:
         import uproot
         with uproot.open(root_file) as f:
@@ -231,7 +208,6 @@ def load_histograms(root_file, use_raw=False):
     except Exception as exc:
         log.warning(f"uproot failed ({exc}), trying PyROOT…")
 
-    # ── PyROOT fallback ──────────────────────────────────────────────────────
     try:
         import ROOT
         ROOT.gROOT.SetBatch(True)
@@ -265,14 +241,13 @@ def load_histograms(root_file, use_raw=False):
 
 
 # =============================================================================
-# PER-CHANNEL FIT WORKER  (called in parallel)
+# PER-CHANNEL FIT WORKER
 # =============================================================================
 
-_WORKER_ARGS = {}   # injected before Pool starts
+_WORKER_ARGS = {}
 
 
 def _worker(args):
-    """Multiprocessing worker: fit all models for one channel."""
     ch_id, hist = args
     models      = _WORKER_ARGS['models']
     n_pk_forced = _WORKER_ARGS['n_peaks_forced']
@@ -290,7 +265,6 @@ def _worker(args):
     if np.sum(hist) < MIN_ENTRIES:
         return ch_id, EMPTY
 
-    # ── Peak detection ────────────────────────────────────────────────────────
     gain_est = float(np.clip(GAIN_DEFAULT, gain_min, gain_max))
     peaks    = detect_peaks(hist, gain_est=gain_est)
     if len(peaks) < 2:
@@ -301,7 +275,6 @@ def _worker(args):
     n_peaks  = int(np.clip(n_pk_forced if n_pk_forced else len(peaks), 2, 8))
     peaks_fit = peaks[:n_peaks]
 
-    # ── Fit window ────────────────────────────────────────────────────────────
     fit_min = max(peaks_fit[0] - 0.5 * gain_est, BIN_CTRS[0])
     fit_max = peaks_fit[-1] + 1.2 * gain_est
     mask    = (BIN_CTRS >= fit_min) & (BIN_CTRS <= fit_max)
@@ -362,7 +335,6 @@ def _result_to_row(ch_id, r):
 
 def save_csvs(all_results, models, out_dir, run_name, gain_min, gain_max,
               chi2_max, r2_min):
-    """Write good/bad/failed CSV files for each model."""
     csv_paths = {}
     for mname in models:
         rows = defaultdict(list)
@@ -379,17 +351,11 @@ def save_csvs(all_results, models, out_dir, run_name, gain_min, gain_max,
 
 
 # =============================================================================
-# TXT OUTPUT  (formatted table, like gain_calibration_old.py)
+# TXT OUTPUT  (formatted table, one per model per category)
 # =============================================================================
 
 def save_txts(all_results, models, out_dir, run_name, gain_min, gain_max,
               chi2_max, r2_min):
-    """
-    Write formatted plain-text tables (one per model per category).
-
-    Columns: Channel | Gain | Gain_Err | Intercept | Int_Err | N_Peaks |
-             Chi2/ndf | R2 | Lin_Chi2 | Mu1 | Sigma_PE | Sigma_Base
-    """
     HDR = (f"{'Channel':<10} {'Gain':<12} {'Gain_Err':<12} {'Intercept':<14} "
            f"{'Int_Err':<12} {'N_Peaks':<10} {'Chi2/ndf':<12} {'R2':<10} "
            f"{'Lin_Chi2':<12} {'Mu1[ADC]':<12} {'Sigma_PE':<12} {'Sigma_Base':<12}\n")
@@ -440,6 +406,153 @@ def save_txts(all_results, models, out_dir, run_name, gain_min, gain_max,
 
 
 # =============================================================================
+# GOOD-CHANNELS FEATURES TXT
+# =============================================================================
+
+def write_good_channels_features_txt(all_results, models, out_dir, run_name,
+                                     gain_min, gain_max, chi2_max, r2_min):
+    """
+    Write RUNXXXX_good_channels_features.txt.
+
+    Uses the FIRST model that yields a 'good' result for each channel.
+    Table columns:
+      Channel | G1 | G2 | G3 | G_out | I1 | I2 | I3 | I_out | I_posit
+
+    where the σ/μ bands are computed from the distribution of gain and
+    intercept values across ALL good channels (using the best model per channel).
+
+    After the table, a summary counts channels for every (G, I) combination.
+    """
+    # ── Collect good results (best model per channel) ─────────────────────────
+    good_rows = []   # list of (ch_id, gain, intercept)
+    for ch_id, mres in all_results.items():
+        for mname in models:
+            r = mres.get(mname, {})
+            if classify(r, gain_min, gain_max, chi2_max, r2_min) == 'good':
+                g  = r.get('gain',      np.nan)
+                ic = r.get('intercept', np.nan)
+                if np.isfinite(g) and np.isfinite(ic):
+                    good_rows.append((ch_id, g, ic))
+                break   # first good model wins
+
+    if not good_rows:
+        log.warning("No good channels found — skipping features file.")
+        return None
+
+    ch_ids   = np.array([r[0] for r in good_rows])
+    gains    = np.array([r[1] for r in good_rows])
+    icepts   = np.array([r[2] for r in good_rows])
+
+    # ── Population statistics ─────────────────────────────────────────────────
+    mu_g  = float(np.mean(gains));   sig_g = float(np.std(gains))
+    mu_i  = float(np.mean(icepts));  sig_i = float(np.std(icepts))
+
+    def _g_cat(g):
+        if   abs(g - mu_g) <= sig_g:             return 'G1'
+        elif abs(g - mu_g) <= 2*sig_g:           return 'G2'
+        elif abs(g - mu_g) <= 3*sig_g:           return 'G3'
+        else:                                      return 'G_out'
+
+    def _i_cat(ic):
+        if   abs(ic - mu_i) <= sig_i:            return 'I1'
+        elif abs(ic - mu_i) <= 2*sig_i:          return 'I2'
+        elif abs(ic - mu_i) <= 3*sig_i:          return 'I3'
+        else:                                      return 'I_out'
+
+    G_CATS = ['G1', 'G2', 'G3', 'G_out']
+    I_CATS = ['I1', 'I2', 'I3', 'I_out', 'I_posit']
+
+    # ── Build per-channel feature dict ────────────────────────────────────────
+    rows_features = []
+    for ch_id, g, ic in sorted(good_rows, key=lambda x: x[0]):
+        gc = _g_cat(g)
+        ic_cat = _i_cat(ic)
+        row = {'Channel': ch_id}
+        for c in G_CATS:
+            row[c] = 'yes' if c == gc else 'no'
+        for c in ['I1', 'I2', 'I3', 'I_out']:
+            row[c] = 'yes' if c == ic_cat else 'no'
+        row['I_posit'] = 'yes' if ic > 0 else 'no'
+        rows_features.append(row)
+
+    # ── Write file ────────────────────────────────────────────────────────────
+    fname = os.path.join(out_dir, f'{run_name}_good_channels_features.txt')
+    ALL_COLS = ['Channel'] + G_CATS + I_CATS
+
+    W = 128
+
+    with open(fname, 'w') as fout:
+        fout.write(f"# TAO Gain Calibration — Good Channels Feature Table\n")
+        fout.write(f"# Run: {run_name}   Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        fout.write(f"# Gain population: μ_G = {mu_g:.1f}  σ_G = {sig_g:.1f}\n")
+        fout.write(f"# Intercept population: μ_I = {mu_i:.1f}  σ_I = {sig_i:.1f}\n")
+        fout.write(f"#\n")
+        fout.write(f"# G1      : gain in [μ_G - σ_G, μ_G + σ_G]\n")
+        fout.write(f"# G2      : gain in [μ_G-2σ, μ_G+2σ] but outside [μ_G-σ, μ_G+σ]\n")
+        fout.write(f"# G3      : gain in [μ_G-3σ, μ_G+3σ] but outside [μ_G-2σ, μ_G+2σ]\n")
+        fout.write(f"# G_out   : gain outside [μ_G-3σ, μ_G+3σ]\n")
+        fout.write(f"# I1      : intercept in [μ_I - σ_I, μ_I + σ_I]\n")
+        fout.write(f"# I2      : intercept in [μ_I-2σ, μ_I+2σ] but outside [μ_I-σ, μ_I+σ]\n")
+        fout.write(f"# I3      : intercept in [μ_I-3σ, μ_I+3σ] but outside [μ_I-2σ, μ_I+2σ]\n")
+        fout.write(f"# I_out   : intercept outside [μ_I-3σ, μ_I+3σ]\n")
+        fout.write(f"# I_posit : intercept > 0\n")
+        fout.write('=' * W + '\n')
+
+        # Header
+        hdr_parts = [f"{'Channel':<12}"]
+        for c in G_CATS + I_CATS:
+            hdr_parts.append(f"{c:<10}")
+        fout.write(''.join(hdr_parts) + '\n')
+        fout.write('-' * W + '\n')
+
+        # Data rows
+        for row in rows_features:
+            parts = [f"{row['Channel']:<12}"]
+            for c in G_CATS + I_CATS:
+                parts.append(f"{row[c]:<10}")
+            fout.write(''.join(parts) + '\n')
+
+        fout.write('=' * W + '\n')
+
+        # ── Summary counts ────────────────────────────────────────────────────
+        fout.write('\n# SUMMARY — Channel counts per (G, I) category combination\n')
+        fout.write('#\n')
+
+        def _count(g_cat, i_cat):
+            return sum(
+                1 for r in rows_features
+                if r[g_cat] == 'yes' and r[i_cat] == 'yes'
+            )
+
+        def _count_g(g_cat):
+            return sum(1 for r in rows_features if r[g_cat] == 'yes')
+
+        def _count_i(i_cat):
+            return sum(1 for r in rows_features if r[i_cat] == 'yes')
+
+        fout.write(f"  Total good channels : {len(rows_features)}\n\n")
+
+        # Single-category counts
+        for gc in G_CATS:
+            fout.write(f"  {gc} = {_count_g(gc)} CHN\n")
+        fout.write('\n')
+        for ic in I_CATS:
+            fout.write(f"  {ic} = {_count_i(ic)} CHN\n")
+        fout.write('\n')
+
+        # Cross-category combinations (G × I)
+        fout.write("  --- G × I combinations ---\n")
+        for gc in G_CATS:
+            for ic in I_CATS:
+                n = _count(gc, ic)
+                fout.write(f"  {gc} & {ic} = {n} CHN\n")
+            fout.write('\n')
+
+    log.info(f"Good-channels features: {fname}  ({len(rows_features)} channels)")
+    return fname
+
+
+# =============================================================================
 # SUMMARY TXT
 # =============================================================================
 
@@ -455,7 +568,6 @@ def _stats(arr):
 
 def write_summary(all_results, models, out_dir, run_name,
                   gain_min, gain_max, chi2_max, r2_min):
-    """Write summary_{run_name}.txt with per-model statistics."""
     fname = os.path.join(out_dir, f'summary_{run_name}.txt')
     lines = []
     W     = 78
@@ -543,8 +655,8 @@ def parse_args():
     p.add_argument('run_name',    help='Run identifier string (used in filenames)')
     p.add_argument('--use-raw',   action='store_true',
                    help='Use raw (non-vetoed) histograms')
-    p.add_argument('--plots',     choices=('none', 'sample', 'all'), default='sample',
-                   help='Plot mode [default: sample (50 per category)]')
+    p.add_argument('--plots',     choices=('none', 'sample', 'all'), default='all',
+                   help='Plot mode [default: all]')
     p.add_argument('--models',    default='all',
                    help='Comma-separated model list or "all" [default: all]')
     p.add_argument('--n-peaks',   type=int, default=None,
@@ -620,12 +732,17 @@ def main():
     save_txts(all_results, models, args.output_dir, args.run_name,
               args.gain_min, args.gain_max, args.chi2_max, args.r2_min)
 
+    # ── Save good-channels features TXT ───────────────────────────────────────
+    log.info('Saving good-channels feature table…')
+    write_good_channels_features_txt(
+        all_results, models, args.output_dir, args.run_name,
+        args.gain_min, args.gain_max, args.chi2_max, args.r2_min)
+
     # ── Plots ─────────────────────────────────────────────────────────────────
     if args.plots != 'none':
         log.info(f'Generating plots (mode={args.plots})…')
         plot_dirs = _make_plot_dirs(args.output_dir, models)
 
-        # Build per-category channel lists per model
         to_plot = {}
         for mname in models:
             cats = defaultdict(list)
@@ -643,7 +760,6 @@ def main():
             else:   # all
                 to_plot[mname] = dict(cats)
 
-        # Identify unique channels to plot
         plot_set = set()
         for mname, sel in to_plot.items():
             for ch_list in sel.values():
@@ -654,7 +770,6 @@ def main():
             hist_ch = histograms.get(ch_id, np.zeros(N_BINS))
             mres    = all_results.get(ch_id, {})
             peaks   = detect_peaks(hist_ch)
-            # Only plot (model, channel) pairs that were selected
             subset = {
                 m: mres.get(m, {}) for m in models
                 if ch_id in to_plot.get(m, {}).get(
@@ -666,7 +781,6 @@ def main():
                          args.gain_min, args.gain_max,
                          args.chi2_max, args.r2_min)
 
-        # Overview distributions
         plot_overview(all_results, models, args.output_dir, args.run_name,
                       args.gain_min, args.gain_max, args.chi2_max, args.r2_min)
 
