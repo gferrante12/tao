@@ -86,12 +86,12 @@ else:
     MAX_ADC_PER_CHANNEL = 1.7e7
     MIN_NHIT = 2000
     MAX_NHIT = 7000
-    TDC_HIT_MIN = 240.0         # ns — UPDATED from 200
-    TDC_HIT_MAX = 440.0         # ns — UPDATED from 450
+    TDC_HIT_MIN = 200.0         # ns
+    TDC_HIT_MAX = 450.0         # ns
     ADC_HIT_MIN = 1000.0
     ADC_HIT_MAX = 1e5
 
-TDC_WINDOW_WIDTH = TDC_HIT_MAX - TDC_HIT_MIN  # 200 ns
+TDC_WINDOW_WIDTH = TDC_HIT_MAX - TDC_HIT_MIN  # 250 ns
 
 # =============================================================================
 # CALIBRATION FILE SELECTION (run-range aware)

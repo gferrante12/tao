@@ -7,7 +7,11 @@ Provides:
     resolve_source()        look up (energy_MeV, description) for a source name
     fit_source()            dispatch to the correct fit_peaks module
 
-All fits use ROOT TF1 (no scipy).
+All actual fitting logic lives in fit_peaks_ge68.py / fit_peaks_cs137.py.
+This module is the single source of truth for source energies and the
+dispatcher that routes a source name to the right fitter.
+
+Fitting uses ROOT TF1 (Minuit MIGRAD) throughout — no scipy.
 """
 
 import numpy as np
@@ -15,9 +19,7 @@ import numpy as np
 try:
     import ROOT
     ROOT.gROOT.SetBatch(True)
-    HAS_ROOT = True
 except ImportError:
-    HAS_ROOT = False
     raise ImportError("ROOT (PyROOT) is required by spectrum_utils — "
                       "make sure it is in your PYTHONPATH before importing this module.")
 
@@ -40,12 +42,22 @@ SOURCES = {
 
 _SOURCES_LC = {k.lower(): (k, v) for k, v in SOURCES.items()}
 
+# Global counter for unique ROOT object names
+_SU_COUNTER = 0
+
+
+def _unique_name(prefix="su"):
+    global _SU_COUNTER
+    _SU_COUNTER += 1
+    return f"{prefix}_{_SU_COUNTER}"
+
 
 # =============================================================================
 # SOURCE RESOLVER
 # =============================================================================
 
 def resolve_source(source_name):
+    """Return (energy_MeV, description) for a named calibration source."""
     if source_name is None or source_name.strip() == '':
         return None, None
     key = source_name.strip().lower()
@@ -61,75 +73,11 @@ def resolve_source(source_name):
 # =============================================================================
 
 def hist_to_arrays(hist):
+    """Extract (bin_centers, counts) numpy arrays from a ROOT TH1."""
     n  = hist.GetNbinsX()
     cx = np.array([hist.GetBinCenter(b)  for b in range(1, n + 1)])
     cy = np.array([hist.GetBinContent(b) for b in range(1, n + 1)])
     return cx, cy
-
-
-# =============================================================================
-# ROOT-BASED CURVE FIT HELPER (replaces scipy.optimize.curve_fit)
-# =============================================================================
-
-_fit_counter = 0
-
-
-def _root_curve_fit(model_func, cx_fit, cy_fit, p0, bounds_lo, bounds_hi):
-    """
-    ROOT TF1-based curve fitting.
-    model_func: callable, signature f(x_array, *params) -> y_array.
-    Returns (popt, perr, chi2, ndf).
-    """
-    global _fit_counter
-    _fit_counter += 1
-    uid = _fit_counter
-
-    n_params = len(p0)
-    n_bins   = len(cx_fit)
-    if n_bins < 2:
-        raise RuntimeError("Too few bins")
-
-    bw   = float(cx_fit[1] - cx_fit[0])
-    xmin = float(cx_fit[0]  - bw / 2)
-    xmax = float(cx_fit[-1] + bw / 2)
-
-    h = ROOT.TH1D(f"_hsu_{uid}", "", n_bins, xmin, xmax)
-    ROOT.SetOwnership(h, True)
-    for i in range(n_bins):
-        v = float(cy_fit[i])
-        h.SetBinContent(i + 1, v)
-        h.SetBinError(i + 1, max(1.0, float(np.sqrt(abs(v)))))
-
-    _f  = model_func
-    _np = n_params
-
-    def _cb(x, p):
-        try:
-            params = [float(p[i]) for i in range(_np)]
-            y = _f(np.array([x[0]]), *params)
-            return float(y[0])
-        except Exception:
-            return 0.0
-
-    tf1 = ROOT.TF1(f"_tf1su_{uid}", _cb, float(cx_fit[0]), float(cx_fit[-1]), n_params)
-    ROOT.SetOwnership(tf1, True)
-
-    for i in range(n_params):
-        tf1.SetParameter(i, float(p0[i]))
-        lo_i = float(bounds_lo[i]) if bounds_lo is not None else -1e30
-        hi_i = float(bounds_hi[i]) if bounds_hi is not None else  1e30
-        if lo_i != hi_i:
-            tf1.SetParLimits(i, lo_i, hi_i)
-
-    fr   = h.Fit(tf1, "SNQR")
-    popt = np.array([tf1.GetParameter(i) for i in range(n_params)], dtype=float)
-    perr = np.array([tf1.GetParError(i)  for i in range(n_params)], dtype=float)
-    chi2 = float(tf1.GetChisquare())
-    ndf  = int(tf1.GetNDF())
-
-    h.Delete()
-    tf1.Delete()
-    return popt, perr, chi2, ndf
 
 
 # =============================================================================
@@ -140,7 +88,12 @@ def fit_source(hist, source_name, dark_noise_pe, method_name="PE", printf=print)
     """
     Dispatch fitting to the correct fit_peaks module based on source_name.
 
-    Returns (simple_result, physics_result).
+    For Ge-68 and Cs-137 dedicated physics-model fitters are used.
+    For all other sources a generic Gaussian + pol3 fit (ROOT TF1) is performed.
+
+    Returns
+    -------
+    (simple_result, physics_result) : tuple of (dict or None, dict or None)
     """
     if hist is None or hist.GetEntries() < 50:
         printf(f"  {method_name}: histogram empty or too few entries — skipping")
@@ -166,30 +119,98 @@ def fit_source(hist, source_name, dark_noise_pe, method_name="PE", printf=print)
                                method_name=method_name, printf=printf)
 
     else:
-        simple = _generic_gauss_pol3(cx, cy, dark_noise_pe,
-                                     source_energy_mev=energy_mev,
-                                     method_name=method_name, printf=printf)
+        simple = _generic_gauss_pol3_root(cx, cy, dark_noise_pe,
+                                          source_energy_mev=energy_mev,
+                                          method_name=method_name, printf=printf)
         return simple, None
 
 
 # =============================================================================
-# GENERIC GAUSSIAN + POL3 FIT (ROOT TF1, for sources without dedicated fitters)
+# ROOT TF1 HELPERS (internal)
 # =============================================================================
 
-def _gauss_pol3_func(x, N, mu, sigma, p0, p1, p2, p3):
-    return (N * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+def _arrays_to_th1d(cx, cy, name=None):
+    """Convert bin-centre / count arrays to ROOT TH1D."""
+    name = name or _unique_name("h")
+    n    = len(cx)
+    if n < 2:
+        return None
+    dx  = (cx[-1] - cx[0]) / max(n - 1, 1)
+    xlo = float(cx[0]  - 0.5 * dx)
+    xhi = float(cx[-1] + 0.5 * dx)
+    h   = ROOT.TH1D(name, "", n, xlo, xhi)
+    h.SetDirectory(0)
+    for i in range(n):
+        v = float(cy[i])
+        h.SetBinContent(i + 1, v)
+        h.SetBinError(i + 1, float(max(1.0, np.sqrt(max(v, 1.0)))))
+    return h
+
+
+class _RootCallable:
+    def __init__(self, fn, n_par):
+        self.fn    = fn
+        self.n_par = n_par
+
+    def __call__(self, x, par):
+        params = [par[i] for i in range(self.n_par)]
+        try:
+            return float(self.fn(float(x[0]), *params))
+        except Exception:
+            return 0.0
+
+
+def _root_fit(model_fn, cx_fit, cy_fit, p0, lo, hi, xmin, xmax):
+    """ROOT TF1 fit. Returns (popt, perr, chi2, ndf, ok)."""
+    n_par     = len(p0)
+    rcallable = _RootCallable(model_fn, n_par)
+    tf1_name  = _unique_name("tf1_su")
+    h_name    = _unique_name("h_su")
+
+    tf1 = ROOT.TF1(tf1_name, rcallable, xmin, xmax, n_par)
+    tf1.SetNpx(1000)
+    for i in range(n_par):
+        tf1.SetParameter(i, float(p0[i]))
+        lo_i, hi_i = float(lo[i]), float(hi[i])
+        if lo_i > -1e29 and hi_i < 1e29:
+            tf1.SetParLimits(i, lo_i, hi_i)
+
+    h = _arrays_to_th1d(cx_fit, cy_fit, h_name)
+    if h is None:
+        return None, None, -1.0, 0, False
+
+    fit_result = h.Fit(tf1, "Q N S R")
+    ok   = (int(fit_result) == 0)
+    popt = np.array([tf1.GetParameter(i) for i in range(n_par)])
+    perr = np.array([tf1.GetParError(i)  for i in range(n_par)])
+    chi2 = float(tf1.GetChisquare())
+    ndf  = int(tf1.GetNDF())
+
+    h.Delete()
+    tf1.Delete()
+    return popt, perr, chi2, ndf, ok
+
+
+# =============================================================================
+# GENERIC GAUSSIAN + POL3 FIT  (ROOT TF1, for sources without dedicated fitters)
+# =============================================================================
+
+def _gauss_pol3_model(x, N, mu, sigma, p0, p1, p2, p3):
+    s = max(abs(sigma), 1e-6)
+    return (N * np.exp(-0.5 * ((x - mu) / s) ** 2)
             + p0 + p1 * x + p2 * x ** 2 + p3 * x ** 3)
 
 
-def _generic_gauss_pol3(cx, cy, dark_noise_pe, source_energy_mev=1.0,
-                        method_name="PE", printf=print):
+def _generic_gauss_pol3_root(cx, cy, dark_noise_pe, source_energy_mev=1.0,
+                               method_name="PE", printf=print):
     """
-    Data-driven Gaussian + pol3 fit via ROOT TF1.
+    Data-driven Gaussian + pol3 fit using ROOT TF1.
+    Peak found at max-counts bin (skipping lower 25%).
     Includes systematic study (3 windows × 3 poly degrees).
     """
-    printf(f"\n{method_name} — fitting {source_energy_mev:.3f} MeV peak (generic gauss+pol3):")
+    printf(f"\n{method_name} — fitting {source_energy_mev:.3f} MeV peak (generic gauss+pol3, ROOT TF1):")
 
-    mid       = len(cx) // 4
+    mid = len(cx) // 4
     search_cy = cy[mid:]
     search_cx = cx[mid:]
     if search_cy.max() < 10:
@@ -215,17 +236,17 @@ def _generic_gauss_pol3(cx, cy, dark_noise_pe, source_energy_mev=1.0,
         return None
 
     cx_fit, cy_fit = cx[mask], cy[mask]
-
     p0_init = [amp_init, mu_init, sig_init,
                float(cy_fit.min()) + 1.0, 0.0, 0.0, 0.0]
-    lo = [0.0, mu_init * 0.70, sig_init * 0.10, -1e30, -1e30, -1e30, -1e30]
+    lo = [0.0,       mu_init * 0.70, sig_init * 0.10, -1e30, -1e30, -1e30, -1e30]
     hi = [amp_init * 20, mu_init * 1.30, sig_init * 5.0,  1e30,  1e30,  1e30,  1e30]
 
-    try:
-        popt, perr, chi2, ndf = _root_curve_fit(
-            _gauss_pol3_func, cx_fit, cy_fit, p0_init, lo, hi)
-    except Exception as exc:
-        printf(f"  ERROR: ROOT fit failed: {exc}")
+    popt, perr, chi2, ndf, ok = _root_fit(
+        _gauss_pol3_model, cx_fit, cy_fit, p0_init, lo, hi,
+        float(cx_fit[0]), float(cx_fit[-1]))
+
+    if popt is None:
+        printf("  ERROR: ROOT TF1 fit returned None")
         return None
 
     mu_fit    = float(popt[1])
@@ -239,22 +260,22 @@ def _generic_gauss_pol3(cx, cy, dark_noise_pe, source_energy_mev=1.0,
         denom = mu_fit
 
     resolution = sigma_fit / denom
-    res_err    = resolution * np.sqrt((sig_err / sigma_fit) ** 2 + (mu_err / denom) ** 2)
+    res_err    = resolution * np.sqrt((sig_err / sigma_fit)**2 + (mu_err / denom)**2) if sigma_fit > 0 else 0.0
 
-    c2ndf = chi2 / ndf if ndf > 0 else -1.0
+    chi2_ndf = float(chi2 / ndf) if ndf > 0 else -1.0
 
-    sys_mu, sys_sig, sys_res = _systematic_study_generic(
+    sys_mu, sys_sig, sys_res = _systematic_study_generic_root(
         cx, cy, mu_fit, sigma_fit, dark_noise_pe)
 
-    mu_err_tot  = float(np.sqrt(mu_err ** 2 + sys_mu ** 2))
-    sig_err_tot = float(np.sqrt(sig_err ** 2 + sys_sig ** 2))
-    res_err_tot = float(np.sqrt(res_err ** 2 + (sys_res / 100.0) ** 2))
+    mu_err_tot  = float(np.sqrt(mu_err**2  + sys_mu**2))
+    sig_err_tot = float(np.sqrt(sig_err**2 + sys_sig**2))
+    res_err_tot = float(np.sqrt(res_err**2 + (sys_res / 100.0)**2))
 
-    printf("  RESULTS (gauss+pol3):")
+    printf(f"  RESULTS (gauss+pol3, ROOT TF1):")
     printf(f"    μ  = {mu_fit:.2f} ± {mu_err_tot:.2f} PE")
     printf(f"    σ  = {sigma_fit:.2f} ± {sig_err_tot:.2f} PE")
     printf(f"    Res = {resolution * 100:.3f} ± {res_err_tot * 100:.3f} %")
-    printf(f"    χ²/ndf = {c2ndf:.2f}")
+    printf(f"    χ²/ndf = {chi2_ndf:.2f}")
 
     return dict(
         peak=mu_fit, sigma=sigma_fit,
@@ -264,52 +285,60 @@ def _generic_gauss_pol3(cx, cy, dark_noise_pe, source_energy_mev=1.0,
         resolution=resolution, resolution_error=res_err_tot,
         resolution_error_stat=float(res_err),
         resolution_error_sys=float(sys_res / 100.0),
-        chi2ndf=c2ndf, status=True,
+        chi2ndf=chi2_ndf, status=True,
         method='gauss+pol3',
     )
 
 
-def _generic_trial_factory(deg):
-    """Build a generic Gauss + poly-deg model callable."""
-    def _trial(x, N, mu, sig, *bp):
-        peak = N * np.exp(-0.5 * ((x - mu) / np.maximum(sig, 1.0)) ** 2)
-        poly = sum(bp[i] * x ** i for i in range(len(bp)))
-        return peak + poly
-    return _trial
+def _gauss_poly_trial(x_sc, N, mu, sk, *bp):
+    """Gaussian + polynomial (variable degree). Used in systematic study."""
+    sig  = sk * np.sqrt(max(abs(mu), 1.0))
+    g    = N * np.exp(-0.5 * ((x_sc - mu) / max(sig, 1e-6))**2)
+    poly = sum(bp[k] * x_sc**k for k in range(len(bp)))
+    return float(g + poly)
 
 
-def _systematic_study_generic(cx, cy, mu_nom, sigma_nom, dark_noise_pe):
-    """3 windows × 3 poly degrees → systematic spread, ROOT TF1 fits."""
+def _systematic_study_generic_root(cx, cy, mu_nom, sigma_nom, dark_noise_pe):
+    """
+    Systematic study using ROOT TF1 fits with 3 window sizes × 3 poly degrees.
+    Returns (sys_mu, sys_sigma, sys_res_pct).
+    """
     range_configs = [(5, 4), (7, 6), (10, 8)]
     poly_degrees  = [1, 2, 3]
-    results = []
+    results       = []
 
-    for (lo, hi) in range_configs:
-        fit_min = mu_nom - lo * sigma_nom
-        fit_max = mu_nom + hi * sigma_nom
-        mask    = (cx >= fit_min) & (cx <= fit_max)
+    for (lo_sig, hi_sig) in range_configs:
+        fit_min = mu_nom - lo_sig * sigma_nom
+        fit_max = mu_nom + hi_sig * sigma_nom
+        mask = (cx >= fit_min) & (cx <= fit_max)
         if mask.sum() < 10:
             continue
         cx_w, cy_w = cx[mask], cy[mask]
 
         for deg in poly_degrees:
-            trial_func = _generic_trial_factory(deg)
-            n_p = 3 + (deg + 1)
-            bkg_p = [float(cy_w.mean())] + [0.0] * deg
-            p0_t  = [float(cy_w.max()), float(mu_nom), float(sigma_nom)] + bkg_p
-            lo_b  = [0.0, mu_nom * 0.7, sigma_nom * 0.1] + [-1e30] * (deg + 1)
-            hi_b  = [float(cy_w.max()) * 20, mu_nom * 1.3, sigma_nom * 5.0] + [1e30] * (deg + 1)
+            n_poly = deg + 1
+            sk_init = sigma_nom / max(np.sqrt(mu_nom), 1.0)
 
-            try:
-                popt, perr, chi2, ndf = _root_curve_fit(
-                    trial_func, cx_w, cy_w, p0_t, lo_b, hi_b)
-                m = float(popt[1])
-                s = abs(float(popt[2]))
-                d = m - dark_noise_pe
-                if d > 0 and s > 0:
-                    results.append(dict(mean=m, sigma=s, resolution=(s / d) * 100.0))
-            except Exception:
-                pass
+            def _trial(x_sc, *args):
+                return _gauss_poly_trial(x_sc, *args)
+
+            bkg_p0 = [float(cy_w.mean())] + [0.0] * deg
+            p0_t   = [float(cy_w.max()), mu_nom, sk_init] + bkg_p0
+            lo_t   = [0.0, mu_nom * 0.7, 0.01] + [-1e30] * n_poly
+            hi_t   = [float(cy_w.max()) * 20, mu_nom * 1.3, 10.0] + [1e30] * n_poly
+
+            popt, perr, chi2, ndf, ok = _root_fit(
+                _trial, cx_w, cy_w, p0_t, lo_t, hi_t,
+                float(cx_w[0]), float(cx_w[-1]))
+
+            if popt is None or not ok:
+                continue
+
+            m    = popt[1]
+            s    = popt[2] * np.sqrt(max(abs(m), 1.0))
+            d    = m - dark_noise_pe
+            if d > 0 and s > 0:
+                results.append(dict(mean=m, sigma=s, resolution=(s / d) * 100.0))
 
     if len(results) < 2:
         return 0.0, 0.0, 0.0
