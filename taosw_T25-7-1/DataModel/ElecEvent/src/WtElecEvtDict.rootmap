@@ -1,7 +1,0 @@
-{ decls }
-namespace Tao {  }
-
-[ libElecEvent.so ]
-# List of selected classes
-class Tao::WtElecEvt
-header Event/WtElecEvt.h

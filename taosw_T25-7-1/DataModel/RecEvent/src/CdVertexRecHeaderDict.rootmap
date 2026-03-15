@@ -1,7 +1,0 @@
-{ decls }
-namespace Tao {  }
-
-[ libRecEvent.so ]
-# List of selected classes
-class Tao::CdVertexRecHeader
-header Event/CdVertexRecHeader.h

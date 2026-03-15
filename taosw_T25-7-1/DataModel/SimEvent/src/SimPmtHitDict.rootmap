@@ -1,9 +1,0 @@
-{ decls }
-namespace std {  }
-namespace Tao {  }
-
-[ libSimEvent.so ]
-# List of selected classes
-class Tao::SimPmtHit
-class vector<Tao::SimPmtHit>
-header Event/SimPmtHit.h

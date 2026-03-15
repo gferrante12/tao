@@ -1,4 +1,0 @@
-add_subdirectory(RecChargeTemplateAlg)
-add_subdirectory(RecProbeTweedieAlg/tao_cvt)
-add_subdirectory(RecQMLEAlg)
-add_subdirectory(RecChargeCenterAlg)

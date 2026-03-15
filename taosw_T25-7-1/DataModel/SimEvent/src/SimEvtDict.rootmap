@@ -1,7 +1,0 @@
-{ decls }
-namespace Tao {  }
-
-[ libSimEvent.so ]
-# List of selected classes
-class Tao::SimEvt
-header Event/SimEvt.h

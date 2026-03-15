@@ -1,9 +1,0 @@
-{ decls }
-namespace std {  }
-namespace Tao {  }
-
-[ libElecEvent.so ]
-# List of selected classes
-class Tao::WtElecChannel
-class vector<Tao::WtElecChannel>
-header Event/WtElecChannel.h

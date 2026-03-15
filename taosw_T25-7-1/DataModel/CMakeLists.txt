@@ -1,6 +1,0 @@
-add_subdirectory (TAOEDMUtil)
-add_subdirectory (SimEvent)
-add_subdirectory (ElecEvent)
-add_subdirectory (CalibEvent)
-add_subdirectory (RecEvent)
-add_subdirectory (RawEvent)

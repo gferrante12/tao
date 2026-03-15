@@ -1,9 +1,0 @@
-{ decls }
-namespace std {  }
-namespace Tao {  }
-
-[ libCalibEvent.so ]
-# List of selected classes
-class Tao::CdCalibChannel
-class vector<Tao::CdCalibChannel>
-header Event/CdCalibChannel.h

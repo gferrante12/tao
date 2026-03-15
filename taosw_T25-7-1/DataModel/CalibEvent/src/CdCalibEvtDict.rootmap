@@ -1,7 +1,0 @@
-{ decls }
-namespace Tao {  }
-
-[ libCalibEvent.so ]
-# List of selected classes
-class Tao::CdCalibEvt
-header Event/CdCalibEvt.h

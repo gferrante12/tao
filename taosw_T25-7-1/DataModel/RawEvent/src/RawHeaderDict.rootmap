@@ -1,7 +1,0 @@
-{ decls }
-namespace Tao {  }
-
-[ libRawEvent.so ]
-# List of selected classes
-class Tao::RawHeader
-header Event/RawHeader.h
