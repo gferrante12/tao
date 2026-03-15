@@ -1,930 +1,936 @@
 #!/usr/bin/env python3
 """
 gain_calibration_stable.py
-==========================
-Stable gain calibration: ROOT-only, multi-Gaussian fit with TSpectrum peak detection.
-Uses ROOT integrated statistics (fit_result.Chi2(), fit_result.Ndf(), etc.).
+===================
+TAO SiPM gain calibration pipeline — main entry point.
 
-Three classification methods:
-  A) Standard:  chi2/ndf + R2 + gain range  (original)
-  B) Relaxed:   bad fits reclassified as good if R2 >= 0.98 AND gain in range
-  C) R2-only:   good if R2 >= 0.98 (ignore chi2 and gain range)
+Delegates plotting to gain_calibration_plots.py and fitting to gain_fit_models.py.
 
-Three classification labels (all methods):
-  good        — passes all quality criteria AND n_peaks >= 3
-  bad         — fit succeeded but quality criteria not met OR n_peaks < 3
-  failed      — fit did not converge / insufficient data
+Usage
+-----
+python gain_calibration_stable.py input.root output_dir run_name [options]
 
-Outputs per method:
-  - RUNXXXX_fit_quality_piechart_METHOD.png
-  - RUNXXXX_summary_plots_METHOD.png          (2 rows: good / bad)
-  - RUNXXXX_{METHOD}_{good|bad|failed}.csv/.txt
-  - RUNXXXX_classification_comparison.txt
+Options
+  --use-raw          Use raw (non-vetoed) histograms [default: clean]
+  --plots {none,sample,all}
+                     none   : skip per-channel plots
+                     sample : 50 random per category
+                     all    : every channel [default]
+  --models M1,M2,…  Comma-separated model list [default: all]
+                     Choices: multigauss multigauss_ct multigauss_ap emg emg_ap
+  --n-peaks INT      Force fixed number of PE peaks [default: auto 2–8]
+  --workers INT      Parallel worker processes [default: CPU count - 1]
+  --chi2-max FLOAT   Maximum chi2/ndf for "good" [default: 100]
+  --r2-min FLOAT     Minimum linear R2 for "good" [default: 0.90]
+  --coti             Apply COTI threshold erf correction to 1PE peak
 
-Usage:
-  python gain_calibration_stable.py input.root output_dir RUN1295
-  python gain_calibration_stable.py input.root output_dir RUN1295 --use-raw
-  python gain_calibration_stable.py input.root output_dir RUN1295 --no-plots
+NOTE: gain_min / gain_max thresholds are no longer used for classification.
 
-Channel fit plots (default behaviour):
-  - Good:   random sample of 100 channels
-  - Bad:    all channels
-  - Failed: only channels with non-zero histogram entries
+Output (inside output_dir/)
+  {run}_{model}_good.csv / bad.csv / failed.csv / good_1pe_issue.csv
+  {run}_{model}_good.txt / bad.txt / failed.txt / good_1pe_issue.txt
+  {run}_{model}_good_channels_features.txt
+  plots/good/{model}/           plots/good_1pe_issue/{model}/
+  plots/bad/{model}/            plots/failed/{model}/
+  plots/overview/{run}_{model}_overview.png
+  summary_{run}.txt
+
+Classification
+  good            : chi2/ndf <= CHI2_MAX  AND  R2 >= R2_MIN
+                    AND  1PE peak bin >= 2PE peak bin in raw histogram
+  good_1pe_issue  : chi2/ndf <= CHI2_MAX  AND  R2 >= R2_MIN
+                    BUT  1PE peak bin < 2PE peak bin in raw histogram
+  bad             : fit converged but outside quality cuts
+  failed          : fit did not converge / no peaks found
 """
 
 import argparse
 import logging
 import os
-import sys
 import random
+import sys
+from collections import defaultdict
+from datetime import datetime
+from itertools import combinations
 from multiprocessing import Pool, cpu_count
 
-import numpy as np
 import matplotlib
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
 try:
     from tqdm import tqdm
 except ImportError:
-    def tqdm(it, **kw):
-        return it
+    def tqdm(iterable, **kw):
+        desc  = kw.get('desc', '')
+        items = list(iterable)
+        n     = len(items)
+        log   = logging.getLogger(__name__)
+        for i, x in enumerate(items):
+            if i % max(1, n // 20) == 0:
+                log.info(f'{desc}: {i}/{n}')
+            yield x
 
-try:
-    import ROOT
-    ROOT.gROOT.SetBatch(True)
-    ROOT.gErrorIgnoreLevel = ROOT.kWarning
-except ImportError:
-    print("ERROR: ROOT (PyROOT) is required for this script.")
-    sys.exit(1)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
+from gain_fit_models import MODEL_NAMES, MODEL_LABELS, fit_channel, linear_fit_gain
+from gain_calibration_plots import (
+    classify, _make_plot_dirs, plot_fit, plot_overview,
+    BIN_WIDTH, BIN_MAX, BIN_CTRS, N_BINS, ALL_CATS,
+)
 
-# =============================================================================
-# CONSTANTS
-# =============================================================================
-BIN_WIDTH  = 100
-BIN_MAX    = 50000
-BINS       = np.arange(0, BIN_MAX + BIN_WIDTH, BIN_WIDTH)
-BIN_CENTERS = (BINS[:-1] + BINS[1:]) / 2.0
-N_BINS     = len(BIN_CENTERS)
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)s: %(message)s')
+log = logging.getLogger(__name__)
 
-# Fit quality thresholds
-CHI2_MAX           = 160.0
-LINEAR_R2_MIN      = 0.99
-R2_RELAXED_MIN     = 0.99     # Method B & C threshold
+# ── Default quality thresholds (gain range removed) ──────────────────────────
+CHI2_MAX     = 100.0
+R2_MIN       = 0.90
+GAIN_DEFAULT = 6_000
+MIN_ENTRIES  = 2_000
+SAMPLE_N     = 50
 
-# Peak detection
-MAX_PEAKS          = 8
-MAX_ADC_SEARCH     = 50000
-PEAK_WIDTH         = 1200.0
-MAX_SIGMA          = 3000.0
-
-# First peak range
-FIRST_PEAK_MIN     = 1500
-FIRST_PEAK_MAX     = 9000
-
-# Expected gain
-EXPECTED_GAIN_MIN     = 3000
-EXPECTED_GAIN_MAX     = 9000
-EXPECTED_GAIN_DEFAULT = 6000
-
-USE_FIRST_PEAK = True
-
-# Gaussian helper (numpy)
-def gaussian(x, A, mu, sigma):
-    return A * np.exp(-(x - mu)**2 / (2 * sigma**2))
-
-def multi_gauss(x, *params):
-    y = np.zeros_like(x, dtype=float)
-    for i in range(len(params) // 3):
-        y += gaussian(x, params[3*i], params[3*i+1], params[3*i+2])
-    return y
 
 # =============================================================================
-# ADAPTIVE GAIN CONSTRAINTS
+# PEAK DETECTION
 # =============================================================================
-def get_adaptive_constraints(estimated_gain):
-    base_gain = EXPECTED_GAIN_DEFAULT
-    ratio = estimated_gain / base_gain
-    return {
-        'min_spacing':    int(EXPECTED_GAIN_MIN * ratio),
-        'max_spacing':    int(EXPECTED_GAIN_MAX * ratio),
-        'first_peak_min': int(FIRST_PEAK_MIN * ratio),
-        'first_peak_max': int(FIRST_PEAK_MAX * ratio),
-        'peak_width':     PEAK_WIDTH * ratio,
-        'fit_margin':     3.0 * ratio,
-    }
 
-def estimate_gain_from_peaks(peaks):
-    if len(peaks) < 2:
-        return -1
-    spacings = [peaks[i+1] - peaks[i] for i in range(len(peaks)-1)]
-    return np.clip(np.median(spacings), EXPECTED_GAIN_MIN, EXPECTED_GAIN_MAX)
+def _gauss_kernel(half_width, sigma_bins):
+    k = np.arange(-half_width, half_width + 1, dtype=float)
+    w = np.exp(-0.5 * (k / sigma_bins)**2)
+    return w / w.sum()
 
-# =============================================================================
-# PEAK FILTERING
-# =============================================================================
-def filter_peaks_adaptive(peaks, hist_data, constraints):
-    if not peaks:
+
+def smooth_hist(hist, sigma_bins=3.0):
+    hw     = max(1, int(3.5 * sigma_bins))
+    kernel = _gauss_kernel(hw, sigma_bins)
+    padded = np.pad(hist.astype(float), hw, mode='edge')
+    return np.convolve(padded, kernel, mode='valid')[:len(hist)]
+
+
+def local_maxima(arr, min_dist):
+    cands = [i for i in range(1, len(arr) - 1)
+             if arr[i] > arr[i - 1] and arr[i] > arr[i + 1]]
+    if not cands:
         return []
-    peaks = sorted([p for p in peaks if p <= MAX_ADC_SEARCH])
-    if not peaks:
+    sel = [cands[0]]
+    for idx in cands[1:]:
+        if idx - sel[-1] >= min_dist:
+            sel.append(idx)
+        elif arr[idx] > arr[sel[-1]]:
+            sel[-1] = idx
+    return sel
+
+
+def detect_peaks(hist, gain_est=GAIN_DEFAULT):
+    """
+    Detect PE peaks in ADC histogram.
+
+    Returns a list of peak positions (ADC values) sorted ascending.
+    The monotone-decreasing height check is intentionally NOT enforced here —
+    channels where 1PE bin < 2PE bin are still returned and later flagged.
+    """
+    if np.sum(hist) < MIN_ENTRIES:
         return []
 
-    # Find first peak in valid range
-    candidates = [p for p in peaks if constraints['first_peak_min'] <= p <= constraints['first_peak_max']]
-    if not candidates:
-        reasonable = [p for p in peaks if 1000 < p < 10000]
-        if reasonable:
-            first_peak = reasonable[0]
-        else:
-            return []
-    else:
-        heights = [hist_data[np.abs(BIN_CENTERS - p).argmin()] for p in candidates]
-        first_peak = candidates[int(np.argmax(heights))]
+    sigma_s  = max(1.0, gain_est / BIN_WIDTH / 10.0)
+    min_sep  = max(2, int(0.5 * gain_est / BIN_WIDTH))
+    smoothed = smooth_hist(hist, sigma_s)
+    idxs     = local_maxima(smoothed, min_sep)
+    if len(idxs) < 2:
+        return []
 
-    valid = [first_peak]
+    win   = max(2, int(2.0 * gain_est / BIN_WIDTH))
+    proms = []
+    for i in idxs:
+        lo = max(0, i - win); hi = min(len(smoothed), i + win + 1)
+        bg = min(smoothed[lo:i].min() if i > lo else smoothed[i],
+                 smoothed[i + 1:hi].min() if i + 1 < hi else smoothed[i])
+        proms.append(smoothed[i] - bg)
+    min_prom = max(max(proms) * 0.005, 3.0)
+    idxs     = [i for i, p in zip(idxs, proms) if p >= min_prom]
+    if len(idxs) < 2:
+        return []
+
+    peaks = sorted(float(BIN_CTRS[i]) for i in idxs)
+
+    cands = ([p for p in peaks if gain_est / 3 <= p <= gain_est * 3]
+             or [p for p in peaks if 300 <= p <= 25_000])
+    if not cands:
+        return []
+    h0 = [hist[int(np.argmin(np.abs(BIN_CTRS - p)))] for p in cands]
+    fp = cands[int(np.argmax(h0))]
+
+    chain = [fp]
     for p in peaks:
-        if p <= first_peak:
+        if p <= fp:
             continue
-        spacing = p - valid[-1]
-        if constraints['min_spacing'] < spacing <= constraints['max_spacing']:
-            valid.append(p)
-            if len(valid) >= MAX_PEAKS:
-                break
-
-    if len(valid) < 2:
-        return []
-
-    # Enforce decreasing height (5% tolerance)
-    heights = [hist_data[np.abs(BIN_CENTERS - p).argmin()] for p in valid]
-    for i in range(len(heights) - 1):
-        if heights[i+1] > heights[i] * 1.05:
-            valid = valid[:i+1]
+        sp = p - chain[-1]
+        if 0.5 * gain_est <= sp <= 1.5 * gain_est:
+            chain.append(p)
+        if len(chain) >= 8:
             break
 
-    return valid if len(valid) >= 2 else []
+    # NOTE: no monotone-height cut here (1PE-issue flagged separately)
+    return chain if len(chain) >= 2 else []
 
-# =============================================================================
-# ROOT CHANNEL FITTING (multi-Gaussian via TF1 + TSpectrum)
-# =============================================================================
-def process_channel_root(ch_id, hist_data):
-    """Fit one channel using ROOT TSpectrum + TF1 multi-Gaussian."""
-    result = {
-        'channel_id': ch_id, 'method': 'root_multigauss',
-        'gain': 0.0, 'gain_error': 0.0,
-        'intercept': 0.0, 'intercept_error': 0.0,
-        'fit_status': -1, 'chi2_dof': -1.0,
-        'n_peaks': 0, 'hist': hist_data,
-        'detected_peaks': [], 'fit_params': [],
-        'linear_r2': 0.0, 'linear_chi2_dof': -1.0,
-    }
 
-    if np.sum(hist_data) < 1000:
-        return result
-
-    estimated_gain = EXPECTED_GAIN_DEFAULT
-    constraints = get_adaptive_constraints(estimated_gain)
-
-    # Build ROOT histogram
-    nbins = len(hist_data)
-    xmin = BIN_CENTERS[0] - BIN_WIDTH / 2
-    xmax = BIN_CENTERS[-1] + BIN_WIDTH / 2
-    h = ROOT.TH1D(f"h_stable_{ch_id}", "", nbins, xmin, xmax)
-    for i, val in enumerate(hist_data):
-        h.SetBinContent(i + 1, val)
-
-    # TSpectrum peak search
-    spectrum = ROOT.TSpectrum(MAX_PEAKS + 2)
-    n_found = spectrum.Search(h, 4.0, "", 0.0005)
-    if n_found < 2:
-        del h
-        return result
-
-    xpeaks = spectrum.GetPositionX()
-    peaks = sorted([xpeaks[i] for i in range(n_found)])
-
-    # Update gain estimate
-    if len(peaks) >= 2:
-        estimated_gain = estimate_gain_from_peaks(peaks)
-        constraints = get_adaptive_constraints(estimated_gain)
-
-    peaks = filter_peaks_adaptive(peaks, hist_data, constraints)
+def _check_1pe_issue(hist, peaks):
+    """Return True if the 1PE peak bin has fewer raw counts than the 2PE peak bin."""
     if len(peaks) < 2:
-        del h
-        return result
+        return False
+    h1 = hist[int(np.argmin(np.abs(BIN_CTRS - peaks[0])))]
+    h2 = hist[int(np.argmin(np.abs(BIN_CTRS - peaks[1])))]
+    return bool(h1 < h2)
 
-    result['detected_peaks'] = peaks
-    result['n_peaks'] = len(peaks)
-
-    fit_peaks = peaks
-    first_peak_number = 1
-    n_fit_peaks = len(fit_peaks)
-
-    # Fit range
-    fit_min = fit_peaks[0] - constraints['peak_width'] * constraints['fit_margin']
-    fit_max = fit_peaks[-1] + constraints['peak_width'] * constraints['fit_margin']
-
-    # Build ROOT TF1 formula
-    parts = []
-    for i in range(n_fit_peaks):
-        a, m, s = 3*i, 3*i+1, 3*i+2
-        parts.append(f"[{a}]*exp(-0.5*((x-[{m}])/[{s}])^2)")
-    formula = "+".join(parts)
-    f1 = ROOT.TF1(f"fit_stable_{ch_id}", formula, fit_min, fit_max)
-
-    # Estimate base sigma via FWHM
-    bin0 = h.FindBin(fit_peaks[0])
-    amp0 = h.GetBinContent(bin0)
-    hm = amp0 / 2.0
-    lb, rb = bin0, bin0
-    while lb > 1 and h.GetBinContent(lb) > hm:
-        lb -= 1
-    while rb < h.GetNbinsX() and h.GetBinContent(rb) > hm:
-        rb += 1
-    fwhm = h.GetBinCenter(rb) - h.GetBinCenter(lb)
-    base_sigma = fwhm / 2.355 if fwhm > 0 else constraints['peak_width']
-    base_sigma = np.clip(base_sigma, 0.15 * estimated_gain, 0.4 * estimated_gain)
-
-    # Set initial parameters and limits
-    for j, pk in enumerate(fit_peaks):
-        bidx = h.FindBin(pk)
-        amp_est = h.GetBinContent(bidx)
-        pe_num = first_peak_number + j
-        sig_est = base_sigma * np.sqrt(pe_num / first_peak_number)
-        mu_tol = 0.3 * estimated_gain
-
-        f1.SetParameter(3*j,     amp_est)
-        f1.SetParameter(3*j + 1, pk)
-        f1.SetParameter(3*j + 2, sig_est)
-        f1.SetParLimits(3*j,     0.05 * amp_est, 20 * amp_est)
-        f1.SetParLimits(3*j + 1, pk - mu_tol, pk + mu_tol)
-        f1.SetParLimits(3*j + 2, 0.2 * sig_est, min(4.0 * sig_est, MAX_SIGMA))
-
-    # Fit using ROOT (S=return result, R=range, B=use par limits, Q=quiet)
-    fit_result = h.Fit(f1, "SRBQ", "", fit_min, fit_max)
-    if not fit_result or int(fit_result) != 0:
-        del h, f1
-        return result
-
-    result['fit_status'] = 1
-
-    # Extract parameters from ROOT fit_result
-    fp = []
-    for j in range(n_fit_peaks):
-        fp.extend([fit_result.Parameter(3*j),
-                   fit_result.Parameter(3*j + 1),
-                   fit_result.Parameter(3*j + 2)])
-    result['fit_params'] = fp
-
-    # Chi2/ndf from ROOT integrated statistics
-    chi2 = fit_result.Chi2()
-    ndf  = fit_result.Ndf()
-    result['chi2_dof'] = chi2 / ndf if ndf > 0 else -1.0
-
-    # Extract peak means and errors
-    mu_vals = [fit_result.Parameter(3*j + 1) for j in range(n_fit_peaks)]
-    mu_errs = [fit_result.ParError(3*j + 1)  for j in range(n_fit_peaks)]
-
-    # Linear fit: mu_n = intercept + gain * n  (ROOT TGraphErrors)
-    peak_numbers = np.arange(first_peak_number, first_peak_number + n_fit_peaks)
-    gr = ROOT.TGraphErrors(n_fit_peaks)
-    for j in range(n_fit_peaks):
-        gr.SetPoint(j, float(peak_numbers[j]), mu_vals[j])
-        gr.SetPointError(j, 0.0, mu_errs[j])
-
-    lin_f = ROOT.TF1(f"lin_stable_{ch_id}", "pol1",
-                      float(first_peak_number), float(first_peak_number + n_fit_peaks - 1))
-    lin_res = gr.Fit(lin_f, "SRQ")
-
-    if lin_res and int(lin_res) == 0:
-        result['intercept']       = lin_res.Parameter(0)
-        result['intercept_error'] = lin_res.ParError(0)
-        result['gain']            = lin_res.Parameter(1)
-        result['gain_error']      = lin_res.ParError(1)
-        lc2 = lin_res.Chi2()
-        lndf = lin_res.Ndf()
-        result['linear_chi2_dof'] = lc2 / lndf if lndf > 0 else -1.0
-
-        # R2
-        y_mean = np.mean(mu_vals)
-        ss_tot = np.sum((np.array(mu_vals) - y_mean)**2)
-        y_pred = [result['intercept'] + result['gain'] * pn for pn in peak_numbers]
-        ss_res = np.sum((np.array(mu_vals) - np.array(y_pred))**2)
-        result['linear_r2'] = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-
-    del h, f1, gr, lin_f
-    return result
 
 # =============================================================================
-# CLASSIFICATION METHODS
+# ROOT HISTOGRAM READER
 # =============================================================================
-def classify_A(r):
-    """Method A: chi2/ndf + R2 + gain range (standard).
-    Requires n_peaks >= 3 for 'good'; n_peaks < 3 -> 'bad'."""
-    if r['fit_status'] != 1:
-        return 'failed'
-    if r['n_peaks'] < 3:
-        return 'bad'
-    if (r['chi2_dof'] <= CHI2_MAX and r['linear_r2'] >= LINEAR_R2_MIN
-            and EXPECTED_GAIN_MIN <= r['gain'] <= EXPECTED_GAIN_MAX):
-        return 'good'
-    return 'bad'
 
-def classify_B(r):
-    """Method B: same as A, but bad fits reclassified as good if R2 >= 0.98 AND gain in range.
-    Requires n_peaks >= 3 for 'good'; n_peaks < 3 -> 'bad'."""
-    if r['fit_status'] != 1:
-        return 'failed'
-    if r['n_peaks'] < 3:
-        return 'bad'
-    # First check standard
-    if (r['chi2_dof'] <= CHI2_MAX and r['linear_r2'] >= LINEAR_R2_MIN
-            and EXPECTED_GAIN_MIN <= r['gain'] <= EXPECTED_GAIN_MAX):
-        return 'good'
-    # Relaxed: reclassify bad -> good if R2 >= 0.98 AND gain in range
-    if r['linear_r2'] >= R2_RELAXED_MIN and EXPECTED_GAIN_MIN <= r['gain'] <= EXPECTED_GAIN_MAX:
-        return 'good'
-    return 'bad'
+def load_histograms(root_file, use_raw=False):
+    prefix     = 'H_adc' + ('raw' if use_raw else 'Clean') + '_'
+    histograms = {}
 
-def classify_C(r):
-    """Method C: R2-only (good if R2 >= 0.98, ignore chi2 and gain range).
-    Requires n_peaks >= 3 for 'good'; n_peaks < 3 -> 'bad'."""
-    if r['fit_status'] != 1:
-        return 'failed'
-    if r['n_peaks'] < 3:
-        return 'bad'
-    if r['linear_r2'] >= R2_RELAXED_MIN:
-        return 'good'
-    return 'bad'
-
-CLASSIFIERS = {
-    'A_standard':    classify_A,
-    'B_relaxed_r2':  classify_B,
-    'C_r2_only':     classify_C,
-}
-
-METHOD_LABELS = {
-    'A_standard':    'Method A: chi2/ndf + R2 + gain range  [good>=3pk / bad / failed]',
-    'B_relaxed_r2':  'Method B: A + reclassify if R2>=0.98 & gain OK  [good>=3pk / bad / failed]',
-    'C_r2_only':     'Method C: R2>=0.98 only  [good>=3pk / bad / failed]',
-}
-
-def split_results(results, classifier_fn):
-    """Split results into good, bad, failed using the given classifier."""
-    good, bad, failed = [], [], []
-    for r in results:
-        label = classifier_fn(r)
-        if label == 'good':
-            good.append(r)
-        elif label == 'bad':
-            bad.append(r)
-        else:
-            failed.append(r)
-    return good, bad, failed
-
-# =============================================================================
-# HELPER: distribution statistics
-# =============================================================================
-def dist_stats(values):
-    """Return min, max, mean, RMS (std) for a list of values."""
-    if not values:
-        return {'min': 0, 'max': 0, 'mean': 0, 'rms': 0, 'n': 0}
-    a = np.array(values)
-    return {'min': float(a.min()), 'max': float(a.max()),
-            'mean': float(a.mean()), 'rms': float(a.std()), 'n': len(a)}
-
-# =============================================================================
-# PLOTTING: Pie chart per method
-# =============================================================================
-def plot_piechart(good, bad, failed, method_key, run_name, out_dir):
-    n_g, n_b, n_f = len(good), len(bad), len(failed)
-    n_tot = n_g + n_b + n_f
-    if n_tot == 0:
-        return
-    pct = lambda n: 100.0 * n / n_tot
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-    sizes  = [n_g,  n_b,  n_f]
-    labels = [
-        f'Good (>=3 peaks)\n{n_g} ({pct(n_g):.1f}%)',
-        f'Bad\n{n_b} ({pct(n_b):.1f}%)',
-        f'Failed\n{n_f} ({pct(n_f):.1f}%)',
-    ]
-    colors  = ['#90EE90', '#FFA07A', '#FFB6C6']
-    # Explode small slices more to separate overlapping labels
-    explode = [0.05 if s / n_tot > 0.10 else 0.15 for s in sizes]
-
-    # Hide slices with 0 count to keep the chart clean
-    nonzero = [(s, l, c, e) for s, l, c, e in zip(sizes, labels, colors, explode) if s > 0]
-    if nonzero:
-        sizes_, labels_, colors_, explode_ = zip(*nonzero)
-    else:
-        sizes_, labels_, colors_, explode_ = sizes, labels, colors, explode
-
-    wedges, texts = ax.pie(sizes_, explode=explode_, labels=labels_, colors=colors_,
-                           startangle=90, labeldistance=1.15,
-                           textprops=dict(fontsize=11, fontweight='bold'))
-
-    # Nudge labels apart when two adjacent slices are both small
-    for i in range(len(texts)):
-        for j in range(i + 1, len(texts)):
-            pos_i = texts[i].get_position()
-            pos_j = texts[j].get_position()
-            dy = abs(pos_i[1] - pos_j[1])
-            dx = abs(pos_i[0] - pos_j[0])
-            if dy < 0.25 and dx < 0.6:
-                # Push them apart vertically
-                shift = (0.25 - dy) / 2 + 0.05
-                if pos_i[1] >= pos_j[1]:
-                    texts[i].set_position((pos_i[0], pos_i[1] + shift))
-                    texts[j].set_position((pos_j[0], pos_j[1] - shift))
-                else:
-                    texts[i].set_position((pos_i[0], pos_i[1] - shift))
-                    texts[j].set_position((pos_j[0], pos_j[1] + shift))
-
-    # Pull the "Failed" label ~2 cm closer to the pie.
-    # Figure is 10x8 in, data span ~3 units -> 2 cm ~ 0.24 data-units.
-    for txt in texts:
-        if txt.get_text().startswith('Failed'):
-            x0, y0 = txt.get_position()
-            # Move towards centre (sign of y0 tells which hemisphere)
-            shift = 0.24 if y0 < 0 else -0.24
-            txt.set_position((x0, y0 + shift))
-
-    ax.axis('equal')
-    plt.title(f'{run_name} — {METHOD_LABELS[method_key]}\nTotal: {n_tot}',
-              fontsize=13, fontweight='bold', pad=20)
-    plt.tight_layout()
-    path = os.path.join(out_dir, f'{run_name}_fit_quality_piechart_{method_key}.png')
-    fig.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    logging.info(f"Saved {path}")
-
-# =============================================================================
-# PLOTTING: Summary plots per method (2x4 grid: good row, bad row)
-# =============================================================================
-def _auto_range(vals):
-    """Return (lo, hi) that shows every entry: min*0.9 .. max*1.1."""
-    vmin, vmax = np.min(vals), np.max(vals)
-    lo = vmin * 0.9 if vmin > 0 else vmin - 0.1 * abs(vmax - vmin)
-    hi = vmax * 1.1 if vmax > 0 else vmax + 0.1 * abs(vmax - vmin)
-    if lo == hi:
-        lo, hi = lo - 1, hi + 1
-    return (lo, hi)
-
-
-def _plot_dist_row(axes, fits, row, category, gain_min, gain_max, is_good=False):
-    """Plot one row (4 columns: gain, intercept, chi2/ndf, R2) for a category."""
-    if 'Bad' in category:
-        color_main = 'red'
-    else:
-        color_main = 'green'
-
-    # Col 0: Gain
-    ax = axes[row, 0]
-    vals = [r['gain'] for r in fits if r['gain'] > 0]
-    if vals:
-        mu, std = np.mean(vals), np.std(vals)
-        rng = _auto_range(vals)
-        ax.hist(vals, bins=50, range=rng, color=color_main, alpha=0.7, edgecolor='k')
-        ax.axvline(mu, c='red', ls='--', lw=2)
-        ax.set_yscale('log')
-        ax.text(0.65, 0.97, f'N={len(vals)}\nmu={mu:.1f}\nsigma={std:.1f}',
-                transform=ax.transAxes, va='top', fontsize=8, family='monospace',
-                bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
-    ax.set_title(f'{category}: Gain', fontweight='bold', fontsize=10)
-    ax.set_xlabel('Gain (ADC/PE)')
-    ax.grid(True, alpha=0.3)
-
-    # Col 1: Intercept
-    ax = axes[row, 1]
-    vals = [r['intercept'] for r in fits]
-    if vals:
-        mu_i, std_i = np.mean(vals), np.std(vals)
-        rng = _auto_range(vals)
-        ax.hist(vals, bins=50, range=rng, color=color_main, alpha=0.7, edgecolor='k')
-        ax.axvline(mu_i, c='red', ls='--', lw=2)
-        ax.set_yscale('log')
-        ax.text(0.65, 0.97, f'N={len(vals)}\nmu={mu_i:.1f}\nsigma={std_i:.1f}',
-                transform=ax.transAxes, va='top', fontsize=8, family='monospace',
-                bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
-    ax.set_title(f'{category}: Intercept', fontweight='bold', fontsize=10)
-    ax.set_xlabel('Intercept (ADC)')
-    ax.grid(True, alpha=0.3)
-
-    # Col 2: chi2/ndf
-    ax = axes[row, 2]
-    vals = [r['chi2_dof'] for r in fits if r['chi2_dof'] > 0]
-    if vals:
-        rng = _auto_range(vals)
-        ax.hist(vals, bins=50, range=rng, color='blue', alpha=0.7, edgecolor='k')
-        ax.set_yscale('log')
-    ax.set_title(f'{category}: chi2/ndf', fontweight='bold', fontsize=10)
-    ax.set_xlabel('chi2/ndf')
-    ax.grid(True, alpha=0.3)
-
-    # Col 3: R2
-    ax = axes[row, 3]
-    vals = [r['linear_r2'] for r in fits if r['linear_r2'] > 0]
-    if vals:
-        rng = _auto_range(vals)
-        # Good fits: force lower limit to 0.989 for readability
-        if is_good:
-            rng = (0.989, rng[1])
-        ax.hist(vals, bins=50, range=rng, color='purple', alpha=0.7, edgecolor='k')
-        ax.set_yscale('log')
-    ax.set_title(f'{category}: R2', fontweight='bold', fontsize=10)
-    ax.set_xlabel('R2')
-    ax.grid(True, alpha=0.3)
-
-
-def plot_summary(good, bad, method_key, run_name, out_dir):
-    # Strip the "[good>=3pk / bad / failed]" suffix from the label
-    method_lbl = METHOD_LABELS[method_key].split('[')[0].strip()
-
-    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-    _plot_dist_row(axes, good, 0, 'Good (>=3 peaks)', EXPECTED_GAIN_MIN, EXPECTED_GAIN_MAX, is_good=True)
-    _plot_dist_row(axes, bad,  1, 'Bad',               EXPECTED_GAIN_MIN, EXPECTED_GAIN_MAX, is_good=False)
-    plt.suptitle(f'{run_name} — {method_lbl}', fontsize=18, fontweight='bold')
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    path = os.path.join(out_dir, f'{run_name}_summary_plots_{method_key}.png')
-    fig.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    logging.info(f"Saved {path}")
-
-# =============================================================================
-# PLOTTING: per-channel fit
-# =============================================================================
-def plot_channel_fit(result, plot_dir, quality_label):
-    ch_id = result['channel_id']
-    hist  = result['hist']
-
-    color_map = {
-        'good':   'green',
-        'bad':    'orange',
-        'failed': 'red',
-    }
-    q_sub         = quality_label.replace('root_multigauss_', '')
-    color         = color_map.get(q_sub, 'gray')
-    quality_upper = q_sub.upper()
-
-    # ── FAILED: single panel (no linear-fit panel) ────────────────────────────
-    if q_sub == 'failed':
-        fig, ax1 = plt.subplots(1, 1, figsize=(10, 6))
-        fig.suptitle(f"Channel {ch_id} (ROOT Multi-Gauss) — {quality_upper}",
-                     fontsize=14, color=color, fontweight='bold')
-
-        ax1.step(BIN_CENTERS, hist, where='mid', color='black',
-                 linewidth=0.8, label='Data')
-        ax1.set_xlabel('ADC', fontsize=12)
-        ax1.set_ylabel('Counts', fontsize=12)
-        ax1.set_yscale('log')
-        y_max = hist.max()
-        if y_max > 0:
-            ax1.set_ylim(0.5, y_max * 5)
-        ax1.set_xlim(0, BIN_MAX)
-        ax1.legend(fontsize=9, loc='upper right')
-        ax1.grid(True, alpha=0.3)
-
-        info = f"STATUS: FAILED\nEvents: {int(np.sum(hist))}"
-        ax1.text(0.02, 0.98, info, transform=ax1.transAxes, va='top', fontsize=9,
-                 family='monospace',
-                 bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
-
-        plt.tight_layout()
-        q_dir = os.path.join(plot_dir, q_sub)
-        os.makedirs(q_dir, exist_ok=True)
-        fig.savefig(os.path.join(q_dir, f"ch{ch_id:04d}_{quality_label}.png"),
-                    dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        return
-
-    # ── GOOD / BAD: two panels (ADC histogram + linear fit) ──────────────────
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle(f"Channel {ch_id} (ROOT Multi-Gauss) — {quality_upper}",
-                 fontsize=12, color=color, fontweight='bold')
-
-    # Left: ADC histogram + fit
-    ax1.step(BIN_CENTERS, hist, where='mid', color='black', linewidth=0.5, alpha=0.8, label='Data')
-
-    if result['fit_status'] == 1 and result['detected_peaks']:
-        peaks = result['detected_peaks']
-        for i, pk in enumerate(peaks):
-            idx = np.abs(BIN_CENTERS - pk).argmin()
-            ax1.plot(pk, hist[idx], 'ro', markersize=5, markeredgecolor='darkred',
-                     label=f'{i+1} PE' if i < 3 else '')
-
-        if result['fit_params']:
-            n_fp = len(result['fit_params']) // 3
-            fp_peaks = peaks[:n_fp] if USE_FIRST_PEAK else peaks[1:n_fp+1]
-            fit_min = fp_peaks[0] - PEAK_WIDTH
-            fit_max = fp_peaks[-1] + PEAK_WIDTH
-            mask = (BIN_CENTERS >= fit_min) & (BIN_CENTERS <= fit_max)
-            x_fit = BIN_CENTERS[mask]
-            y_fit = multi_gauss(x_fit, *result['fit_params'])
-            ax1.plot(x_fit, y_fit, 'b-', linewidth=1.5, alpha=0.8, label='Multi-Gauss fit')
-
-            for i in range(n_fp):
-                mu_i = result['fit_params'][3*i + 1]
-                sig_i = result['fit_params'][3*i + 2]
-                pe = i + 1
-                ax1.axvline(mu_i, color=f'C{i}', ls='--', lw=1.2, alpha=0.7,
-                            label=f'{pe} PE: mu={mu_i:.0f}, sigma={sig_i:.0f}')
-
-    ax1.set_xlabel('ADC'); ax1.set_ylabel('Counts')
-    ax1.set_yscale('log')
-    y_max = hist.max()
-    if y_max > 0:
-        ax1.set_ylim(0.5, y_max * 200)
-    ax1.legend(fontsize=7, ncol=2, loc='upper right')
-    ax1.grid(True, alpha=0.3)
-
-    # Info box
-    if result['fit_status'] == 1:
-        info = (f"STATUS: SUCCESS\nQuality: {quality_upper}\n"
-                f"Events: {int(np.sum(hist))}\n"
-                f"Peaks used: {result['n_peaks']}\n"
-                f"chi2/ndf: {result['chi2_dof']:.2f}")
-    else:
-        info = f"STATUS: FAILED\nEvents: {int(np.sum(hist))}"
-    bbox_c = 'lightgreen' if q_sub == 'good' else ('lightyellow' if q_sub == 'bad' else 'lightcoral')
-    ax1.text(0.02, 0.98, info, transform=ax1.transAxes, va='top', fontsize=8,
-             family='monospace', bbox=dict(boxstyle='round', facecolor=bbox_c, alpha=0.7))
-
-    # Right: linear fit
-    if result['fit_status'] == 1 and result['gain'] > 0 and result['fit_params']:
-        n_fp = len(result['fit_params']) // 3
-        if n_fp >= 2:
-            pns = list(range(1, n_fp + 1))
-            mus = [result['fit_params'][3*i + 1] for i in range(n_fp)]
-            ax2.plot(pns, mus, 'o', color='blue', markersize=8, label='Fitted Means')
-            x_l = np.array([1, n_fp])
-            y_l = result['intercept'] + result['gain'] * x_l
-            ax2.plot(x_l, y_l, 'r-', lw=2.5,
-                     label=f"mu = {result['intercept']:.0f} + {result['gain']:.0f}*n")
-            ax2.set_xlabel('Peak Number (PE)'); ax2.set_ylabel('ADC')
-            ax2.set_title('Gain Calculation', fontweight='bold')
-            ax2.legend(loc='lower right', fontsize=9)
-            ax2.grid(True, alpha=0.3)
-            gain_info = (f"Gain: {result['gain']:.0f} +/- {result['gain_error']:.0f} ADC/PE\n"
-                         f"R2: {result['linear_r2']:.4f}\n"
-                         f"Lin chi2/ndf: {result['linear_chi2_dof']:.2f}")
-            ax2.text(0.05, 0.97, gain_info, transform=ax2.transAxes, va='top',
-                     fontsize=9, family='monospace',
-                     bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.85))
-    else:
-        ax2.text(0.5, 0.5, 'No successful fit', transform=ax2.transAxes,
-                 ha='center', va='center', fontsize=12, color='red')
-
-    plt.tight_layout()
-    q_dir = os.path.join(plot_dir, q_sub)
-    os.makedirs(q_dir, exist_ok=True)
-    fig.savefig(os.path.join(q_dir, f"ch{ch_id:04d}_{quality_label}.png"),
-                dpi=150, bbox_inches='tight')
-    plt.close(fig)
-
-# =============================================================================
-# COMPARISON TXT
-# =============================================================================
-def write_comparison_txt(results, run_name, out_dir):
-    """Write a TXT file comparing all three classification methods."""
-    n_total = len(results)
-    path = os.path.join(out_dir, f'{run_name}_classification_comparison.txt')
-
-    with open(path, 'w') as f:
-        f.write(f"{'='*110}\n")
-        f.write(f"CLASSIFICATION COMPARISON — {run_name}\n")
-        f.write(f"Total channels analysed: {n_total}\n")
-        f.write(f"NOTE: 'good' requires n_peaks >= 3; channels with n_peaks < 3 are classified as 'bad'\n")
-        f.write(f"{'='*110}\n\n")
-
-        # Summary header
-        f.write(f"{'Method':<50} {'Good>=3pk':<16} {'Bad':<14} {'Failed':<14}\n")
-        f.write(f"{'-'*110}\n")
-
-        method_splits = {}
-        for mk, cfn in CLASSIFIERS.items():
-            g, b, fl = split_results(results, cfn)
-            method_splits[mk] = (g, b, fl)
-            ng, nb, nf = len(g), len(b), len(fl)
-            pg  = 100*ng  / n_total if n_total else 0
-            pb  = 100*nb  / n_total if n_total else 0
-            pf  = 100*nf  / n_total if n_total else 0
-            f.write(f"{METHOD_LABELS[mk]:<50} "
-                    f"{ng:>5} ({pg:>5.1f}%)  "
-                    f"{nb:>5} ({pb:>5.1f}%)  "
-                    f"{nf:>5} ({pf:>5.1f}%)\n")
-
-        f.write(f"\n{'='*110}\n")
-        f.write(f"DETAILED STATISTICS PER METHOD\n")
-        f.write(f"{'='*110}\n")
-
-        for mk in CLASSIFIERS:
-            g, b, fl = method_splits[mk]
-            f.write(f"\n{'─'*110}\n")
-            f.write(f"{METHOD_LABELS[mk]}\n")
-            f.write(f"{'─'*110}\n")
-
-            for cat_name, cat_list in [('GOOD FITS (>=3 peaks)', g),
-                                        ('BAD FITS', b)]:
-                f.write(f"\n  {cat_name} ({len(cat_list)} channels):\n")
-                if not cat_list:
-                    f.write(f"    (none)\n")
+    try:
+        import uproot
+        with uproot.open(root_file) as f:
+            for key in f.keys():
+                name = key.split(';')[0]
+                if not name.startswith(prefix):
                     continue
+                try:
+                    ch_id = int(name[len(prefix):])
+                except ValueError:
+                    continue
+                h = f[key]
+                vals, edges = h.to_numpy()
+                ctrs = 0.5 * (edges[:-1] + edges[1:])
+                out  = np.zeros(N_BINS, dtype=float)
+                for c, v in zip(ctrs, vals):
+                    bi = int(np.argmin(np.abs(BIN_CTRS - c)))
+                    out[bi] += v
+                histograms[ch_id] = out
+        log.info(f"[uproot] Loaded {len(histograms)} histograms from {root_file}")
+        return histograms
+    except ImportError:
+        pass
+    except Exception as exc:
+        log.warning(f"uproot failed ({exc}), trying PyROOT...")
 
-                # Zero / non-zero histogram breakdown (for bad and failed)
-                if 'BAD' in cat_name:
-                    n_nz = sum(1 for r in cat_list if np.sum(r['hist']) > 0)
-                    n_z  = len(cat_list) - n_nz
-                    f.write(f"    Histogram entries:      non-zero = {n_nz},  zero (empty) = {n_z}\n")
+    try:
+        import ROOT
+        ROOT.gROOT.SetBatch(True)
+        f = ROOT.TFile.Open(root_file, 'READ')
+        if not f or f.IsZombie():
+            raise IOError(f"Cannot open {root_file}")
+        for key in f.GetListOfKeys():
+            name = key.GetName()
+            if not name.startswith(prefix):
+                continue
+            try:
+                ch_id = int(name[len(prefix):])
+            except ValueError:
+                continue
+            h = f.Get(name)
+            if not h:
+                continue
+            nb    = h.GetNbinsX()
+            ctrs_ = np.array([h.GetBinCenter(b)  for b in range(1, nb + 1)])
+            vals_ = np.array([h.GetBinContent(b) for b in range(1, nb + 1)])
+            out   = np.zeros(N_BINS, dtype=float)
+            for c, v in zip(ctrs_, vals_):
+                bi = int(np.argmin(np.abs(BIN_CTRS - c)))
+                out[bi] += v
+            histograms[ch_id] = out
+        f.Close()
+        log.info(f"[PyROOT] Loaded {len(histograms)} histograms from {root_file}")
+        return histograms
+    except ImportError:
+        raise RuntimeError("Neither uproot nor PyROOT is available.")
 
-                gains      = [r['gain']       for r in cat_list if r['gain'] > 0]
-                intercepts = [r['intercept']  for r in cat_list]
-                chi2s      = [r['chi2_dof']   for r in cat_list if r['chi2_dof'] > 0]
-                r2s        = [r['linear_r2']  for r in cat_list if r['linear_r2'] > 0]
-
-                for dist_name, vals in [('Gain (ADC/PE)', gains),
-                                         ('Intercept (ADC)', intercepts),
-                                         ('chi2/ndf', chi2s),
-                                         ('R2', r2s)]:
-                    s = dist_stats(vals)
-                    f.write(f"    {dist_name:<25} N={s['n']:>5}  "
-                            f"min={s['min']:>10.3f}  max={s['max']:>10.3f}  "
-                            f"mean={s['mean']:>10.3f}  RMS={s['rms']:>10.3f}\n")
-
-            # Failed fits: always report zero/non-zero breakdown
-            f.write(f"\n  FAILED FITS ({len(fl)} channels):\n")
-            if fl:
-                n_nz = sum(1 for r in fl if np.sum(r['hist']) > 0)
-                n_z  = len(fl) - n_nz
-                f.write(f"    Histogram entries:      non-zero = {n_nz},  zero (empty) = {n_z}\n")
-            else:
-                f.write(f"    (none)\n")
-
-        f.write(f"\n{'='*110}\n")
-        f.write(f"END OF COMPARISON\n")
-        f.write(f"{'='*110}\n")
-
-    logging.info(f"Saved comparison: {path}")
-
-# =============================================================================
-# CSV / TXT output
-# =============================================================================
-def save_results_csv_txt(result_list, filepath_base):
-    """Save results as both CSV-like TXT and machine-readable TXT."""
-    import csv
-    csv_path = filepath_base + '.csv'
-    txt_path = filepath_base + '.txt'
-
-    fieldnames = ['channel_id', 'gain', 'gain_error', 'intercept', 'intercept_error',
-                  'n_peaks', 'chi2_dof', 'linear_r2', 'linear_chi2_dof']
-
-    with open(csv_path, 'w', newline='') as cf:
-        writer = csv.DictWriter(cf, fieldnames=fieldnames, extrasaction='ignore')
-        writer.writeheader()
-        for r in result_list:
-            writer.writerow({k: r.get(k, '') for k in fieldnames})
-
-    with open(txt_path, 'w') as tf:
-        tf.write(f"{'Channel':<10} {'Gain':<12} {'Gain_Err':<12} {'Intercept':<14} "
-                 f"{'Int_Err':<12} {'N_Peaks':<10} {'Chi2/ndf':<12} {'R2':<10} "
-                 f"{'Lin_Chi2':<12}\n")
-        tf.write("=" * 104 + "\n")
-        for r in result_list:
-            tf.write(f"{r['channel_id']:<10} {r['gain']:<12.2f} {r['gain_error']:<12.2f} "
-                     f"{r['intercept']:<14.2f} {r['intercept_error']:<12.2f} "
-                     f"{r['n_peaks']:<10} {r['chi2_dof']:<12.3f} "
-                     f"{r['linear_r2']:<10.4f} {r['linear_chi2_dof']:<12.3f}\n")
-
-    logging.info(f"Saved {csv_path} and {txt_path}")
 
 # =============================================================================
-# WORKER for multiprocessing
+# PER-CHANNEL FIT WORKER
 # =============================================================================
+
+_WORKER_ARGS = {}
+
+
 def _worker(args):
-    ch_id, hist_data = args
-    return process_channel_root(ch_id, hist_data)
+    """Multiprocessing worker: fit all models for one channel."""
+    ch_id, hist = args
+    models      = _WORKER_ARGS['models']
+    n_pk_forced = _WORKER_ARGS['n_peaks_forced']
+    apply_coti  = _WORKER_ARGS['apply_coti']
+
+    EMPTY = {m: dict(success=False, gain=0.0, gain_err=np.inf,
+                     chi2_dof=-1.0, r2_linear=0.0, n_peaks=0,
+                     linear_chi2_dof=-1.0, has_1pe_issue=False,
+                     y_fit=None, extra={}, _par_fit={}, _x_data=None,
+                     param_names=[], popt=None)
+             for m in models}
+
+    if np.sum(hist) < MIN_ENTRIES:
+        return ch_id, EMPTY
+
+    peaks = detect_peaks(hist, gain_est=GAIN_DEFAULT)
+    if len(peaks) < 2:
+        return ch_id, EMPTY
+
+    # ── 1PE issue flag (computed once, from raw histogram) ────────────────────
+    has_1pe_issue = _check_1pe_issue(hist, peaks)
+
+    spacings = [peaks[i + 1] - peaks[i] for i in range(len(peaks) - 1)]
+    gain_est = float(np.clip(np.median(spacings), 100.0, 50_000.0))
+    n_peaks  = int(np.clip(n_pk_forced if n_pk_forced else len(peaks), 2, 8))
+    peaks_fit = peaks[:n_peaks]
+
+    fit_min = max(peaks_fit[0] - 0.5 * gain_est, BIN_CTRS[0])
+    fit_max = peaks_fit[-1] + 1.2 * gain_est
+    mask    = (BIN_CTRS >= fit_min) & (BIN_CTRS <= fit_max)
+    x_fit   = BIN_CTRS[mask]
+    y_fit   = hist[mask]
+
+    if len(x_fit) < 5 or np.sum(y_fit) < 100:
+        return ch_id, EMPTY
+
+    results = {}
+    for mname in models:
+        r = fit_channel(
+            x_fit, y_fit, n_peaks, peaks_fit, gain_est,
+            mname, apply_coti=apply_coti)
+        # Stamp the 1PE issue flag onto every model result
+        r['has_1pe_issue'] = has_1pe_issue
+        results[mname] = r
+
+    return ch_id, results
+
+
+# =============================================================================
+# CSV / TXT OUTPUT
+# =============================================================================
+
+RESULT_COLS = [
+    'channel_id', 'n_peaks', 'gain', 'gain_err',
+    'intercept', 'intercept_err', 'chi2_dof', 'r2_linear', 'linear_chi2_dof',
+    'has_1pe_issue',
+    'sigma_pe', 'sigma_base',
+    'tau', 'tau_err', 'p_ct_emg',
+    'p_ct', 'p_ct_err',
+    'q_ap', 'q_ap_rel', 'alpha', 'alpha_err',
+]
+
+
+def _result_to_row(ch_id, r):
+    extra = r.get('extra', {})
+    return {
+        'channel_id':      ch_id,
+        'n_peaks':         r.get('n_peaks', 0),
+        'gain':            r.get('gain',      np.nan),
+        'gain_err':        r.get('gain_err',  np.nan),
+        'intercept':       r.get('intercept', np.nan),
+        'intercept_err':   r.get('intercept_err', np.nan),
+        'chi2_dof':        r.get('chi2_dof',  np.nan),
+        'r2_linear':       r.get('r2_linear', np.nan),
+        'linear_chi2_dof': r.get('linear_chi2_dof', np.nan),
+        'has_1pe_issue':   int(r.get('has_1pe_issue', False)),
+        'sigma_pe':        extra.get('sigma_pe',   np.nan),
+        'sigma_base':      extra.get('sigma_base', np.nan),
+        'tau':             extra.get('tau',         np.nan),
+        'tau_err':         extra.get('tau_err',     np.nan),
+        'p_ct_emg':        extra.get('p_ct_emg',   np.nan),
+        'p_ct':            extra.get('p_ct',        np.nan),
+        'p_ct_err':        extra.get('p_ct_err',   np.nan),
+        'q_ap':            extra.get('q_ap',        np.nan),
+        'q_ap_rel':        extra.get('q_ap_rel',   np.nan),
+        'alpha':           extra.get('alpha',       np.nan),
+        'alpha_err':       extra.get('alpha_err',  np.nan),
+    }
+
+
+def save_csvs(all_results, models, out_dir, run_name, chi2_max, r2_min):
+    csv_paths = {}
+    for mname in models:
+        rows = defaultdict(list)
+        for ch_id, mres in all_results.items():
+            r   = mres.get(mname, {})
+            cat = classify(r, chi2_max=chi2_max, r2_min=r2_min)
+            rows[cat].append(_result_to_row(ch_id, r))
+        for cat in ALL_CATS:
+            fname = os.path.join(out_dir, f'{run_name}_{mname}_{cat}.csv')
+            pd.DataFrame(rows[cat], columns=RESULT_COLS).to_csv(fname, index=False)
+            csv_paths[(mname, cat)] = fname
+            log.info(f"  -> {fname}  ({len(rows[cat])} channels)")
+    return csv_paths
+
+
+def save_txts(all_results, models, out_dir, run_name, chi2_max, r2_min):
+    HDR = (f"{'Channel':<10} {'Gain':<12} {'Gain_Err':<12} {'Intercept':<14} "
+           f"{'Int_Err':<12} {'N_Peaks':<10} {'Chi2/ndf':<12} {'R2':<10} "
+           f"{'Lin_Chi2':<12} {'1PE_issue':<12} {'Mu1[ADC]':<12} "
+           f"{'Sigma_PE':<12} {'Sigma_Base':<12}\n")
+    SEP = '=' * 150 + '\n'
+
+    txt_paths = {}
+    for mname in models:
+        rows_by_cat = defaultdict(list)
+        for ch_id, mres in all_results.items():
+            r   = mres.get(mname, {})
+            cat = classify(r, chi2_max=chi2_max, r2_min=r2_min)
+            rows_by_cat[cat].append((ch_id, r))
+
+        for cat in ALL_CATS:
+            fname = os.path.join(out_dir, f'{run_name}_{mname}_{cat}.txt')
+            with open(fname, 'w') as fout:
+                fout.write(f"# TAO Gain Calibration  --  model={mname}  cat={cat}\n")
+                fout.write(f"# Run: {run_name}   Generated: "
+                           f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                fout.write(f"# Quality cuts: chi2/ndf<={chi2_max}  R2>={r2_min}\n")
+                fout.write(SEP)
+                fout.write(HDR)
+                fout.write(SEP)
+                for ch_id, r in sorted(rows_by_cat[cat], key=lambda x: x[0]):
+                    pf    = r.get('_par_fit', {})
+                    extra = r.get('extra', {})
+                    mu1   = pf.get('mu1',          0.0)
+                    spe   = extra.get('sigma_pe',   0.0)
+                    sbase = extra.get('sigma_base', 0.0)
+                    issue = 'YES' if r.get('has_1pe_issue') else 'no'
+                    fout.write(
+                        f"{ch_id:<10} "
+                        f"{r.get('gain',          0.0):<12.2f} "
+                        f"{r.get('gain_err',       0.0):<12.2f} "
+                        f"{r.get('intercept',      0.0):<14.2f} "
+                        f"{r.get('intercept_err',  0.0):<12.2f} "
+                        f"{r.get('n_peaks',           0):<10} "
+                        f"{r.get('chi2_dof',       -1.0):<12.3f} "
+                        f"{r.get('r2_linear',       0.0):<10.4f} "
+                        f"{r.get('linear_chi2_dof',-1.0):<12.3f} "
+                        f"{issue:<12} "
+                        f"{mu1:<12.2f} "
+                        f"{spe:<12.2f} "
+                        f"{sbase:<12.2f}\n"
+                    )
+            txt_paths[(mname, cat)] = fname
+            log.info(f"  -> {fname}  ({len(rows_by_cat[cat])} channels)")
+    return txt_paths
+
+
+# =============================================================================
+# GOOD CHANNELS FEATURES TXT
+# =============================================================================
+
+def save_good_channels_features(all_results, models, out_dir, run_name,
+                                  chi2_max, r2_min):
+    """
+    Write {run}_{model}_good_channels_features.txt for each model.
+
+    Includes ALL channels that passed quality cuts ('good' + 'good_1pe_issue').
+
+    File structure
+    --------------
+    SECTION 0  — Category definitions (legend)
+    CHANNEL TABLE — per-channel yes/no flags for all categories
+    SECTION 1  — Count summary: all combinations of G x I x 1PE_issue
+    SECTION 2  — Channel ID lists for exceptional features:
+                 G_out, I_out, I_posit, 1PE_issue, and ALL combinations
+                 (including same-quantity combos e.g. I_out & I_posit)
+    """
+    G_CATS  = ['G1', 'G2', 'G3', 'G_out']
+    I_CATS  = ['I1', 'I2', 'I3', 'I_out', 'I_posit']
+    # Features tracked in section 2 (channel ID lists)
+    SPECIAL = ['G_out', 'I_out', 'I_posit', '1PE_issue']
+
+    SEP   = '-' * 140 + '\n'
+    THICK = '=' * 140 + '\n'
+
+    for mname in models:
+        # ── collect channels that passed quality cuts ─────────────────────
+        good_rows = []
+        for ch_id, mres in all_results.items():
+            r   = mres.get(mname, {})
+            cat = classify(r, chi2_max=chi2_max, r2_min=r2_min)
+            if cat in ('good', 'good_1pe_issue'):
+                good_rows.append((ch_id, r))
+
+        if not good_rows:
+            log.info(f"  No good channels for model {mname} — skipping features file")
+            continue
+
+        gains  = np.array([r.get('gain',      np.nan) for _, r in good_rows])
+        icepts = np.array([r.get('intercept', np.nan) for _, r in good_rows])
+
+        gains_ok  = gains [np.isfinite(gains)]
+        icepts_ok = icepts[np.isfinite(icepts)]
+        mu_g  = float(np.mean(gains_ok))  if len(gains_ok)  > 0 else 0.0
+        sig_g = float(np.std(gains_ok))   if len(gains_ok)  > 1 else 1.0
+        mu_i  = float(np.mean(icepts_ok)) if len(icepts_ok) > 0 else 0.0
+        sig_i = float(np.std(icepts_ok))  if len(icepts_ok) > 1 else 1.0
+
+        def _gc(g):
+            if not np.isfinite(g): return 'G_out'
+            d = abs(g - mu_g)
+            if d <= sig_g:        return 'G1'
+            if d <= 2.0 * sig_g:  return 'G2'
+            if d <= 3.0 * sig_g:  return 'G3'
+            return 'G_out'
+
+        def _ic(ic):
+            if not np.isfinite(ic): return 'I_out'
+            d = abs(ic - mu_i)
+            if d <= sig_i:        return 'I1'
+            if d <= 2.0 * sig_i:  return 'I2'
+            if d <= 3.0 * sig_i:  return 'I3'
+            return 'I_out'
+
+        cfs = []
+        for ch_id, r in good_rows:
+            g  = r.get('gain',      np.nan)
+            ic = r.get('intercept', np.nan)
+            cfs.append(dict(
+                ch_id    = ch_id,
+                gain     = g,
+                intercept= ic,
+                gc       = _gc(g),
+                icc      = _ic(ic),
+                i_posit  = (np.isfinite(ic) and ic > 0),
+                pe_issue = bool(r.get('has_1pe_issue', False)),
+            ))
+
+        # ── helper predicates ─────────────────────────────────────────────
+        def _has(cf, feat):
+            if feat == 'G_out':     return cf['gc']  == 'G_out'
+            if feat == 'I_out':     return cf['icc'] == 'I_out'
+            if feat == 'I_posit':   return cf['i_posit']
+            if feat == '1PE_issue': return cf['pe_issue']
+            raise ValueError(feat)
+
+        def _count(feat_list):
+            return sum(1 for cf in cfs if all(_has(cf, f) for f in feat_list))
+
+        def _ids(feat_list):
+            return sorted(cf['ch_id'] for cf in cfs
+                          if all(_has(cf, f) for f in feat_list))
+
+        # ── write ─────────────────────────────────────────────────────────
+        fname = os.path.join(out_dir,
+                             f'{run_name}_{mname}_good_channels_features.txt')
+
+        with open(fname, 'w') as fout:
+
+            # ─────────────── SECTION 0: definitions ──────────────────────
+            fout.write(THICK)
+            fout.write("# TAO Gain Calibration — Good Channels Feature Table\n")
+            fout.write(f"# Run: {run_name}   Model: {mname}\n")
+            fout.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            fout.write(f"# Channels included: 'good' + 'good_1pe_issue'  "
+                       f"total = {len(cfs)}\n")
+            fout.write(f"# Gain distribution  :  mu_g  = {mu_g:.2f},  "
+                       f"sig_g = {sig_g:.2f} ADC/PE\n")
+            fout.write(f"# Intercept distrib. :  mu_i  = {mu_i:.2f},  "
+                       f"sig_i = {sig_i:.2f} ADC\n")
+            fout.write(THICK)
+            fout.write("# SECTION 0 - Category definitions\n")
+            fout.write("#\n")
+            fout.write("# Gain categories  (mu_g, sig_g computed over all good channels)\n")
+            fout.write("#   G1       : gain in  [mu_g - sig_g  ; mu_g + sig_g]\n")
+            fout.write("#   G2       : gain in  [mu_g - 2*sig_g; mu_g + 2*sig_g]"
+                       "  but outside G1\n")
+            fout.write("#   G3       : gain in  [mu_g - 3*sig_g; mu_g + 3*sig_g]"
+                       "  but outside G2\n")
+            fout.write("#   G_out    : gain outside [mu_g - 3*sig_g; mu_g + 3*sig_g]\n")
+            fout.write("#\n")
+            fout.write("# Intercept categories  (mu_i, sig_i computed over all good channels)\n")
+            fout.write("#   I1       : intercept in  [mu_i - sig_i  ; mu_i + sig_i]\n")
+            fout.write("#   I2       : intercept in  [mu_i - 2*sig_i; mu_i + 2*sig_i]"
+                       "  but outside I1\n")
+            fout.write("#   I3       : intercept in  [mu_i - 3*sig_i; mu_i + 3*sig_i]"
+                       "  but outside I2\n")
+            fout.write("#   I_out    : intercept outside [mu_i - 3*sig_i; mu_i + 3*sig_i]\n")
+            fout.write("#   I_posit  : intercept > 0\n")
+            fout.write("#\n")
+            fout.write("# Additional flag\n")
+            fout.write("#   1PE_issue : 1PE peak bin count < 2PE peak bin count"
+                       " in the raw ADC histogram\n")
+            fout.write("#               Fit is still performed; channel classified"
+                       " as 'good_1pe_issue'\n")
+            fout.write(THICK)
+
+            # ─────────────── Per-channel table ───────────────────────────
+            fout.write("# CHANNEL TABLE  (yes/no flags for each category)\n")
+            hdr = (f"{'Channel':<10} {'Gain':>12} {'Intercept':>12} "
+                   f"{'G1':>5} {'G2':>5} {'G3':>5} {'G_out':>7} "
+                   f"{'I1':>5} {'I2':>5} {'I3':>5} {'I_out':>7} "
+                   f"{'I_posit':>9} {'1PE_issue':>11}\n")
+            fout.write(SEP)
+            fout.write(hdr)
+            fout.write(SEP)
+            for cf in sorted(cfs, key=lambda x: x['ch_id']):
+                g_s  = (f"{cf['gain']:.2f}"      if np.isfinite(cf['gain'])
+                        else 'nan')
+                ic_s = (f"{cf['intercept']:.2f}" if np.isfinite(cf['intercept'])
+                        else 'nan')
+                fout.write(
+                    f"{cf['ch_id']:<10} {g_s:>12} {ic_s:>12} "
+                    f"{'yes' if cf['gc']  == 'G1'    else 'no':>5} "
+                    f"{'yes' if cf['gc']  == 'G2'    else 'no':>5} "
+                    f"{'yes' if cf['gc']  == 'G3'    else 'no':>5} "
+                    f"{'yes' if cf['gc']  == 'G_out' else 'no':>7} "
+                    f"{'yes' if cf['icc'] == 'I1'    else 'no':>5} "
+                    f"{'yes' if cf['icc'] == 'I2'    else 'no':>5} "
+                    f"{'yes' if cf['icc'] == 'I3'    else 'no':>5} "
+                    f"{'yes' if cf['icc'] == 'I_out' else 'no':>7} "
+                    f"{'yes' if cf['i_posit']         else 'no':>9} "
+                    f"{'yes' if cf['pe_issue']         else 'no':>11}\n"
+                )
+            fout.write(SEP)
+
+            # ─────────────── SECTION 1: count summary ────────────────────
+            fout.write("\n")
+            fout.write(THICK)
+            fout.write("# SECTION 1 - Channel count summary\n")
+            fout.write(f"# Total good channels: {len(cfs)}\n")
+            fout.write("#\n")
+
+            # Single G categories
+            for gc in G_CATS:
+                n = sum(1 for cf in cfs if cf['gc'] == gc)
+                fout.write(f"$ {gc:<12} = {n} CHN\n")
+            fout.write("#\n")
+
+            # G x I combinations
+            for gc in G_CATS:
+                for ic in I_CATS:
+                    if ic == 'I_posit':
+                        n = sum(1 for cf in cfs
+                                if cf['gc'] == gc and cf['i_posit'])
+                    else:
+                        n = sum(1 for cf in cfs
+                                if cf['gc'] == gc and cf['icc'] == ic)
+                    fout.write(f"$ {gc:<7} & {ic:<12} = {n} CHN\n")
+                fout.write("#\n")
+
+            # Single I categories
+            for ic in I_CATS:
+                if ic == 'I_posit':
+                    n = sum(1 for cf in cfs if cf['i_posit'])
+                else:
+                    n = sum(1 for cf in cfs if cf['icc'] == ic)
+                fout.write(f"$ {ic:<12} = {n} CHN\n")
+            fout.write("#\n")
+
+            # 1PE_issue alone
+            n_iss = sum(1 for cf in cfs if cf['pe_issue'])
+            fout.write(f"$ {'1PE_issue':<12} = {n_iss} CHN\n")
+            fout.write("#\n")
+
+            # 1PE_issue x G
+            for gc in G_CATS:
+                n = sum(1 for cf in cfs if cf['pe_issue'] and cf['gc'] == gc)
+                fout.write(f"$ {'1PE_issue':<7} & {gc:<12} = {n} CHN\n")
+            fout.write("#\n")
+
+            # 1PE_issue x I
+            for ic in I_CATS:
+                if ic == 'I_posit':
+                    n = sum(1 for cf in cfs if cf['pe_issue'] and cf['i_posit'])
+                else:
+                    n = sum(1 for cf in cfs
+                            if cf['pe_issue'] and cf['icc'] == ic)
+                fout.write(f"$ {'1PE_issue':<7} & {ic:<12} = {n} CHN\n")
+            fout.write(THICK)
+
+            # ─────────────── SECTION 2: channel ID lists ─────────────────
+            fout.write("# SECTION 2 - Channel ID lists for exceptional features\n")
+            fout.write("#   Features: G_out, I_out, I_posit, 1PE_issue\n")
+            fout.write("#   All subsets of size 1..4 are listed.\n")
+            fout.write("#   Same-quantity combinations (e.g. I_out & I_posit)"
+                       " are included.\n")
+            fout.write("#\n")
+
+            for size in range(1, len(SPECIAL) + 1):
+                for combo in combinations(SPECIAL, size):
+                    label = ' & '.join(combo)
+                    ids   = _ids(list(combo))
+                    fout.write(f"# {label}  ({len(ids)} CHN):\n")
+                    if not ids:
+                        fout.write("#   (none)\n")
+                    else:
+                        for k in range(0, len(ids), 10):
+                            chunk = ids[k:k + 10]
+                            fout.write(
+                                "#   " + ', '.join(str(c) for c in chunk) + '\n')
+                    fout.write("#\n")
+
+            fout.write(THICK)
+
+        log.info(f"  -> {fname}  ({len(cfs)} good channels)")
+
+
+# =============================================================================
+# SUMMARY TXT
+# =============================================================================
+
+def _stats(arr):
+    a = np.array([x for x in arr if np.isfinite(x)])
+    if len(a) == 0:
+        return dict(n=0, mean=np.nan, std=np.nan, median=np.nan,
+                    p16=np.nan, p84=np.nan)
+    return dict(n=len(a), mean=float(np.mean(a)), std=float(np.std(a)),
+                median=float(np.median(a)),
+                p16=float(np.percentile(a, 16)),
+                p84=float(np.percentile(a, 84)))
+
+
+def write_summary(all_results, models, out_dir, run_name, chi2_max, r2_min):
+    fname = os.path.join(out_dir, f'summary_{run_name}.txt')
+    lines = []
+    W     = 78
+
+    def hdr(s):
+        lines.append('=' * W); lines.append(f'  {s}'); lines.append('=' * W)
+
+    def sub(s):
+        lines.append('-' * W); lines.append(f'  {s}'); lines.append('-' * W)
+
+    def fmt_stats(label, s):
+        lines.append(
+            f"    {label:<20s}  n={s['n']:5d}  "
+            f"mean={s['mean']:10.3f}  std={s['std']:9.3f}  "
+            f"median={s['median']:10.3f}  "
+            f"[{s['p16']:.3f}, {s['p84']:.3f}] (68%)")
+
+    hdr('TAO GAIN CALIBRATION SUMMARY')
+    lines.append(f'  Run: {run_name}')
+    lines.append(f'  Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    lines.append(f'  Quality cuts: chi2/ndf <= {chi2_max}  R2 >= {r2_min}')
+    lines.append(f'  (Gain range removed from classification)')
+    lines.append(f'  Total channels: {len(all_results)}')
+    lines.append('')
+
+    for mname in models:
+        sub(f'MODEL: {MODEL_LABELS.get(mname, mname)}  ({mname})')
+        cats = {c: [] for c in ALL_CATS}
+        for ch_id, mres in all_results.items():
+            r   = mres.get(mname, {})
+            cat = classify(r, chi2_max=chi2_max, r2_min=r2_min)
+            cats[cat].append(r)
+
+        ng  = len(cats['good'])
+        ni  = len(cats['good_1pe_issue'])
+        nb  = len(cats['bad'])
+        nf  = len(cats['failed'])
+        tot = ng + ni + nb + nf
+        lines.append(f'  Channels:  good={ng} ({100*ng/tot:.1f}%)  '
+                     f'1PE_issue={ni} ({100*ni/tot:.1f}%)  '
+                     f'bad={nb} ({100*nb/tot:.1f}%)  '
+                     f'failed={nf} ({100*nf/tot:.1f}%)  total={tot}')
+        lines.append('')
+
+        for catname, rlist in [('GOOD', cats['good']),
+                                ('GOOD_1PE_ISSUE', cats['good_1pe_issue']),
+                                ('BAD', cats['bad'])]:
+            if not rlist:
+                continue
+            lines.append(f'  -- {catname} channels ({len(rlist)}) --')
+            fmt_stats('Gain [ADC/PE]',
+                      _stats([r.get('gain',      np.nan) for r in rlist]))
+            fmt_stats('chi2/ndf',
+                      _stats([r.get('chi2_dof',  np.nan) for r in rlist]))
+            fmt_stats('R2 (linear)',
+                      _stats([r.get('r2_linear', np.nan) for r in rlist]))
+            fmt_stats('Lin chi2/ndf',
+                      _stats([r.get('linear_chi2_dof', np.nan) for r in rlist]))
+            if mname in ('emg', 'emg_ap'):
+                fmt_stats('tau [ADC]',
+                          _stats([r.get('extra', {}).get('tau',      np.nan)
+                                  for r in rlist]))
+                fmt_stats('p_ct (tau/G)',
+                          _stats([r.get('extra', {}).get('p_ct_emg', np.nan)
+                                  for r in rlist]))
+            if mname == 'multigauss_ct':
+                fmt_stats('p_ct (binom)',
+                          _stats([r.get('extra', {}).get('p_ct',     np.nan)
+                                  for r in rlist]))
+            if mname in ('multigauss_ap', 'emg_ap'):
+                fmt_stats('alpha (AP)',
+                          _stats([r.get('extra', {}).get('alpha',    np.nan)
+                                  for r in rlist]))
+                fmt_stats('Q_ap/Gain',
+                          _stats([r.get('extra', {}).get('q_ap_rel', np.nan)
+                                  for r in rlist]))
+            lines.append('')
+
+    lines += ['=' * W, 'END OF SUMMARY', '=' * W]
+    with open(fname, 'w') as fout:
+        fout.write('\n'.join(lines) + '\n')
+    log.info(f'Summary written to {fname}')
+    return fname
+
 
 # =============================================================================
 # MAIN
 # =============================================================================
+
+def parse_args():
+    p = argparse.ArgumentParser(description='TAO SiPM gain calibration')
+    p.add_argument('input_root', help='Input ROOT file with ADC histograms')
+    p.add_argument('output_dir', help='Output directory')
+    p.add_argument('run_name',   help='Run identifier string (used in filenames)')
+    p.add_argument('--use-raw',  action='store_true',
+                   help='Use raw (non-vetoed) histograms')
+    p.add_argument('--plots',    choices=('none', 'sample', 'all'), default='all',
+                   help='Plot mode [default: all (every channel)]')
+    p.add_argument('--models',   default='all',
+                   help='Comma-separated model list or "all" [default: all]')
+    p.add_argument('--n-peaks',  type=int, default=None,
+                   help='Force fixed number of PE peaks [default: auto]')
+    p.add_argument('--workers',  type=int, default=max(1, cpu_count() - 1),
+                   help='Parallel workers [default: CPU count - 1]')
+    p.add_argument('--chi2-max', type=float, default=CHI2_MAX,
+                   help=f'Maximum chi2/ndf for "good" [default: {CHI2_MAX}]')
+    p.add_argument('--r2-min',   type=float, default=R2_MIN,
+                   help=f'Minimum linear R2 for "good" [default: {R2_MIN}]')
+    p.add_argument('--coti',     action='store_true',
+                   help='Apply COTI threshold erf correction to 1PE peak')
+    return p.parse_args()
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description='Stable multi-Gaussian gain calibration (ROOT only, 3 classification methods).\n'
-                    'Plots: good=sample100, bad=all, failed=non-zero only.')
-    parser.add_argument('input_root', help='Input ROOT file with ADC histograms')
-    parser.add_argument('output_dir', help='Output directory')
-    parser.add_argument('run_name',   help='Run name (e.g. RUN1295)')
-    parser.add_argument('--use-raw', action='store_true',
-                        help='Use raw (H_adcraw_*) instead of clean (H_adcClean_*)')
-    parser.add_argument('--no-plots', action='store_true',
-                        help='Skip channel fit plot generation')
-    args = parser.parse_args()
-
-    if not os.path.exists(args.input_root):
-        logging.error(f"Input file not found: {args.input_root}")
-        sys.exit(1)
-
+    args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    plot_dir = os.path.join(args.output_dir, f"plots_{args.run_name}")
-    os.makedirs(plot_dir, exist_ok=True)
-    for sub in ['good', 'bad', 'failed']:
-        os.makedirs(os.path.join(plot_dir, sub), exist_ok=True)
 
-    # ── Load histograms ──────────────────────────────────────────────────────
-    logging.info(f"Loading histograms from {args.input_root} ...")
-    prefix = "H_adcraw_" if args.use_raw else "H_adcClean_"
+    # ── Model selection ───────────────────────────────────────────────────────
+    if args.models == 'all':
+        models = list(MODEL_NAMES)
+    else:
+        models = [m.strip() for m in args.models.split(',')]
+        for m in models:
+            if m not in MODEL_NAMES:
+                log.error(f"Unknown model '{m}'. Valid: {list(MODEL_NAMES)}")
+                sys.exit(1)
+    log.info(f'Models: {models}')
+    log.info(f'Quality cuts: chi2/ndf<={args.chi2_max}  R2>={args.r2_min}  '
+             f'(no gain range cut)')
 
-    f = ROOT.TFile.Open(args.input_root, "READ")
-    if not f or f.IsZombie():
-        logging.error("Cannot open ROOT file"); sys.exit(1)
+    # ── Load histograms ───────────────────────────────────────────────────────
+    log.info(f'Loading histograms from {args.input_root}')
+    histograms = load_histograms(args.input_root, use_raw=args.use_raw)
+    log.info(f'Total channels loaded: {len(histograms)}')
 
-    channel_ids = []
-    for key in f.GetListOfKeys():
-        name = key.GetName()
-        if name.startswith(prefix):
-            try:
-                channel_ids.append(int(name.replace(prefix, "")))
-            except ValueError:
-                continue
-    channel_ids.sort()
+    # ── Inject config for workers ─────────────────────────────────────────────
+    global _WORKER_ARGS
+    _WORKER_ARGS.update(
+        models=models,
+        n_peaks_forced=args.n_peaks,
+        apply_coti=args.coti,
+    )
 
-    if not channel_ids:
-        logging.error("No ADC histograms found!"); f.Close(); sys.exit(1)
+    # ── Run fits in parallel ──────────────────────────────────────────────────
+    log.info(f'Fitting {len(histograms)} channels with {args.workers} worker(s)...')
+    work_items  = [(ch_id, hist) for ch_id, hist in histograms.items()]
+    all_results = {}
 
-    logging.info(f"Found {len(channel_ids)} channels")
+    if args.workers > 1:
+        with Pool(processes=args.workers, initializer=lambda: None) as pool:
+            for ch_id, mres in tqdm(
+                    pool.imap_unordered(_worker, work_items, chunksize=4),
+                    total=len(work_items), desc='Fitting'):
+                all_results[ch_id] = mres
+    else:
+        for item in tqdm(work_items, desc='Fitting'):
+            ch_id, mres = _worker(item)
+            all_results[ch_id] = mres
 
-    channel_data = []
-    for ch in channel_ids:
-        h = f.Get(f"{prefix}{ch}")
-        if h:
-            arr = np.zeros(N_BINS)
-            for i, bc in enumerate(BIN_CENTERS):
-                bidx = h.FindBin(bc)
-                if 1 <= bidx <= h.GetNbinsX():
-                    arr[i] = h.GetBinContent(bidx)
-            channel_data.append((ch, arr))
-        else:
-            channel_data.append((ch, np.zeros(N_BINS)))
-    f.Close()
+    # ── Save outputs ──────────────────────────────────────────────────────────
+    log.info('Saving CSV results...')
+    save_csvs(all_results, models, args.output_dir, args.run_name,
+              args.chi2_max, args.r2_min)
 
-    # ── Fit all channels ─────────────────────────────────────────────────────
-    n_workers = min(8, max(1, cpu_count() - 1))
-    logging.info(f"Fitting {len(channel_data)} channels ({n_workers} workers) ...")
+    log.info('Saving TXT tables...')
+    save_txts(all_results, models, args.output_dir, args.run_name,
+              args.chi2_max, args.r2_min)
 
-    with Pool(n_workers) as pool:
-        results = list(tqdm(pool.imap(_worker, channel_data),
-                            total=len(channel_data), desc="Fitting"))
+    log.info('Saving good-channels features TXT...')
+    save_good_channels_features(
+        all_results, models, args.output_dir, args.run_name,
+        args.chi2_max, args.r2_min)
 
-    # ── For each method: classify, plot, save ────────────────────────────────
-    for mk, cfn in CLASSIFIERS.items():
-        logging.info(f"\n{'='*60}")
-        logging.info(f"Classification: {METHOD_LABELS[mk]}")
-        good, bad, failed = split_results(results, cfn)
-        ng, nb, nf = len(good), len(bad), len(failed)
-        logging.info(f"  Good (>=3 peaks): {ng}   Bad: {nb}   Failed: {nf}")
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    if args.plots != 'none':
+        log.info(f'Generating plots (mode={args.plots})...')
+        plot_dirs = _make_plot_dirs(args.output_dir, models)
 
-        # Save CSV/TXT per category
-        save_results_csv_txt(good,   os.path.join(args.output_dir, f'{args.run_name}_{mk}_good'))
-        save_results_csv_txt(bad,    os.path.join(args.output_dir, f'{args.run_name}_{mk}_bad'))
-        save_results_csv_txt(failed, os.path.join(args.output_dir, f'{args.run_name}_{mk}_failed'))
+        to_plot = {}
+        for mname in models:
+            cats = defaultdict(list)
+            for ch_id, mres in all_results.items():
+                r   = mres.get(mname, {})
+                cat = classify(r, chi2_max=args.chi2_max, r2_min=args.r2_min)
+                cats[cat].append(ch_id)
+            if args.plots == 'sample':
+                sel = {}
+                rng = random.Random(42)
+                for cat, chs in cats.items():
+                    sel[cat] = rng.sample(chs, min(SAMPLE_N, len(chs)))
+                to_plot[mname] = sel
+            else:
+                to_plot[mname] = dict(cats)
 
-        # Pie chart
-        plot_piechart(good, bad, failed, mk, args.run_name, args.output_dir)
+        plot_set = set()
+        for mname, sel in to_plot.items():
+            for ch_list in sel.values():
+                plot_set.update(ch_list)
 
-        # Summary plots
-        plot_summary(good, bad, mk, args.run_name, args.output_dir)
+        log.info(f'  {len(plot_set)} unique channels to plot')
+        for ch_id in tqdm(sorted(plot_set), desc='Plotting'):
+            hist_ch = histograms.get(ch_id, np.zeros(N_BINS))
+            mres    = all_results.get(ch_id, {})
+            peaks   = detect_peaks(hist_ch)
+            subset  = {
+                m: mres.get(m, {}) for m in models
+                if ch_id in to_plot.get(m, {}).get(
+                    classify(mres.get(m, {}),
+                             chi2_max=args.chi2_max, r2_min=args.r2_min), [])
+            }
+            if subset:
+                plot_fit(ch_id, hist_ch, subset, peaks, plot_dirs,
+                         chi2_max=args.chi2_max, r2_min=args.r2_min)
 
-    # ── Comparison TXT ───────────────────────────────────────────────────────
-    write_comparison_txt(results, args.run_name, args.output_dir)
+        plot_overview(all_results, models, args.output_dir, args.run_name,
+                      chi2_max=args.chi2_max, r2_min=args.r2_min)
 
-    # ── Channel fit plots (method A classification for folder sorting) ───────
-    if not args.no_plots:
-        logging.info(f"\nGenerating channel fit plots ...")
-        good_A, bad_A, failed_A = split_results(results, classify_A)
+    # ── Summary ───────────────────────────────────────────────────────────────
+    write_summary(all_results, models, args.output_dir, args.run_name,
+                  args.chi2_max, args.r2_min)
 
-        # Good: always sample <=100
-        good_sample = random.sample(good_A, min(100, len(good_A))) if good_A else []
-        logging.info(f"  Good: plotting {len(good_sample)}/{len(good_A)} (sampled)")
+    # ── Console ───────────────────────────────────────────────────────────────
+    print('\n' + '=' * 72)
+    print(f'  GAIN CALIBRATION COMPLETE  --  Run {args.run_name}')
+    print('=' * 72)
+    for mname in models:
+        ng = ni = nb = nf = 0
+        gains = []
+        for mres in all_results.values():
+            r   = mres.get(mname, {})
+            cat = classify(r, chi2_max=args.chi2_max, r2_min=args.r2_min)
+            if cat == 'good':
+                ng += 1; gains.append(r['gain'])
+            elif cat == 'good_1pe_issue':
+                ni += 1; gains.append(r['gain'])
+            elif cat == 'bad':
+                nb += 1
+            else:
+                nf += 1
+        g_str = (f"{np.mean(gains):.0f} +/- {np.std(gains):.0f}"
+                 if gains else 'n/a')
+        print(f"  {mname:<20s}  good={ng:5d}  1PE_iss={ni:5d}  "
+              f"bad={nb:5d}  fail={nf:5d}  <gain>={g_str}")
+    print('=' * 72 + '\n')
 
-        # Bad: always plot all
-        logging.info(f"  Bad: plotting all {len(bad_A)}")
 
-        # Failed: plot only channels with non-zero histogram entries
-        failed_nonzero = [r for r in failed_A if np.sum(r['hist']) > 0]
-        failed_zero    = [r for r in failed_A if np.sum(r['hist']) == 0]
-        logging.info(f"  Failed: plotting {len(failed_nonzero)}/{len(failed_A)} "
-                     f"(non-zero entries; {len(failed_zero)} empty)")
-
-        for r in tqdm(good_sample,    desc="Good plots (sample)"):
-            plot_channel_fit(r, plot_dir, 'root_multigauss_good')
-        for r in tqdm(bad_A,          desc="Bad plots (all)"):
-            plot_channel_fit(r, plot_dir, 'root_multigauss_bad')
-        for r in tqdm(failed_nonzero, desc="Failed plots (non-zero)"):
-            plot_channel_fit(r, plot_dir, 'root_multigauss_failed')
-
-    logging.info(f"\nDone! Results in {args.output_dir}")
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
